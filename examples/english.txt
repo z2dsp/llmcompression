@@ -1,0 +1,7 @@
+On Saturday morning, Maya walked to the library to return a book about the ocean. The streets were quiet, and the air smelled of rain. A small dog waited outside the bakery while its owner bought a loaf of bread. Nothing unusual happened, but Maya noticed how easy it was to guess what would happen next.
+
+Language works in a similar way. If someone says that they spread butter on a slice of fresh bread, the last word is fairly predictable. A good language model assigns that word a high probability. A compressor can then describe it using very few bits. An unexpected word takes more bits, but it can still be stored and recovered exactly.
+
+The person reading the compressed message needs the same language model. They begin with the same probabilities, recover the first word, and use it to predict the next one. Step by step, both sides build the same context. There is no need to send the predictions, because the reader can calculate them too.
+
+This demonstration uses tokens rather than whole words. Common words may be single tokens, while less familiar words may be split into several pieces. Spaces, punctuation, and line breaks are part of the message as well. The goal is to recover every byte of the original text, including the final newline.

@@ -1,0 +1,9 @@
+.venv/
+.cache/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+*.llmc
+restored.txt
+demo-results.json
