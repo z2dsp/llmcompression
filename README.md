@@ -103,6 +103,40 @@ Arithmetic decoding requires exactly matching integer probability tables. Both d
 
 Archives record and check Python, PyTorch (including the build suffix), Transformers, Tokenizers, NumPy, OS, architecture, and PyTorch's CPU capability. These checks reduce accidental mismatches; they do **not** guarantee portability between different CPUs or builds. Keep the original environment and cached model for reliable decoding. A final SHA-256 check detects an incorrect reconstruction before the CLI writes the restored file. This is an educational format, rather than a long-term archival format or a hardened decoder for hostile files.
 
+## Train a small model on MeshCore messages
+
+See [MCU_TRAINING.md](MCU_TRAINING.md) for database extraction, configurable
+statistical language model training, measured compression results, and an MCU
+porting guide. The integer model is a separate compression backend, with no
+PyTorch requirement at inference. It is not yet integrated into the MeshCore GUI.
+
+```bash
+python extract_messages.py data/meshcore.db --output data/messages.jsonl
+python train_compression_model.py data/messages.jsonl \
+  --model-kib 256 --output models/my-256k
+python mcu_compress.py info --model models/my-256k/model.mcblm
+```
+
+The extraction script needs only Python; training needs NumPy. Local data and
+trained models are excluded from Git and the demo ZIP.
+
+The statistical trainer accepts any finite `--order` and has no software upper
+limit on `--model-kib`; available memory and storage determine practical sizes.
+For example, `--model-kib 131072 --order 64` requests a 128 MiB budget and a
+64-byte context. History resets for each message.
+
+For the full English Wikipedia training corpus, use
+`prepare_wikipedia.py download` and `prepare_wikipedia.py prepare`, then pass
+`data/wikipedia/prepared` to the trainer. Downloads and preparation are resumable;
+prepared-corpus training streams batches without loading the corpus into RAM.
+Training counts batches with up to four worker threads by default; use
+`--workers N` to configure it or `--workers 1` for serial counting.
+See the [Wikipedia workflow](MCU_TRAINING.md#download-and-prepare-the-full-english-wikipedia)
+for the additional PyArrow dependency and commands.
+For longer Wikipedia contexts, prepare a fresh corpus with larger
+`--sample-bytes`, or `--sample-bytes 0` for whole articles and train with
+`--max-message-bytes 0`. The existing prepared corpus uses 160-byte samples.
+
 ## Tests and source
 
 ```bash
@@ -122,3 +156,14 @@ Tests cover changing arithmetic distributions, rare symbols, coding length versu
 - `llm_compression/demo.py`: original English sample and size comparison.
 
 For the broader connection between prediction and compression, see [Language Modeling Is Compression](https://arxiv.org/abs/2309.10668).
+
+Compare MCU model budgets and context depths with `sweep_compression_models.py`; see the [sweep workflow](MCU_TRAINING.md#sweep-model-size-and-context-depth) for commands and generated compression plots.
+
+Train bounded-storage neural byte models on the same datasets with `train_nn_compression_model.py`; see [neural comparison training](MCU_TRAINING.md#train-neural-models-for-comparison).
+
+Use `train_nn_cuda.py` for CUDA training and `sweep_nn_cuda.py` for model-size/context
+sweeps, GPU validation, and early stopping; see [MCU_TRAINING.md](MCU_TRAINING.md).
+
+For integer inference and lossless compression on a Raspberry Pi Pico W, see the
+[Pico MicroPython demo](pico/README.md), including Viper kernels and measured
+[benchmark results](pico/benchmark-results.json).

@@ -1,0 +1,105 @@
+{
+  "model_bytes": 50212,
+  "hidden": 108,
+  "cpu_hz": 125000000,
+  "uname": [
+    "rp2",
+    "rp2",
+    "1.26.1",
+    "v1.26.1 on 2025-09-11 (GNU 14.2.0 MinSizeRel)",
+    "Raspberry Pi Pico W with RP2040"
+  ],
+  "firmware": "(name='micropython', version=(1, 26, 1, ''), _machine='Raspberry Pi Pico W with RP2040', _mpy=4870, _build='RPI_PICO_W', _thread='unsafe')",
+  "iterations": 30,
+  "memory": {
+    "free_after_benchmark": 101584,
+    "allocated_after_benchmark": 103984,
+    "free_before_load": 184160,
+    "model_heap_delta": 63280,
+    "free_flash_bytes": 208896,
+    "free_after_load": 120880
+  },
+  "prediction": {
+    "viper_speedup": 23.6282332,
+    "stage_us": {
+      "dense1": 1792.2,
+      "tanh_lut": 254.633332,
+      "dense2": 17719.6,
+      "softmax_and_cdf": 6891.6,
+      "features": 820.93336
+    },
+    "estimated_clock_cycles_per_byte": 3407641.6,
+    "viper_us_per_byte": 27261.132,
+    "python_us_per_byte": 644132.4
+  },
+  "sample": {
+    "original_bytes": 1298,
+    "all_round_trips_exact": true,
+    "messages": 30,
+    "encode_bytes_per_second": 37.02356,
+    "decode_bytes_per_second": 36.220844,
+    "bits_per_original_byte": 3.229584,
+    "decode_us": 35835720,
+    "all_payloads_match_desktop": true,
+    "extra_correctness_vectors": 4,
+    "cdf_contexts_match_desktop": 32,
+    "payload_bytes": 524,
+    "encode_us": 35058756
+  },
+  "notes": [
+    "Wall-clock measurements at the existing CPU frequency; no overclocking or second core.",
+    "Cycle estimate is elapsed time times CPU frequency, not a hardware cycle-counter measurement.",
+    "Model is pre-shared; payload size excludes length, integrity, and radio framing.",
+    "Heap delta includes weights, lookup tables, and persistent inference buffers; modules already imported.",
+    "Stage timings include loop/call overhead and activation/softmax scratch restoration.",
+    "Private messages are not printed in this report."
+  ],
+  "context": 3,
+  "embedding": 8,
+  "model_manifest": {
+    "format": "MCPNN001",
+    "source": "models/nn-cuda-sweep-mc-small/32k-context3/model.mcnn",
+    "source_sha256": "8567f0a295007e353beaeca6b0ba5896e2b2225c796ad06b2d5f4b6d1ebc31c0",
+    "source_bytes": 32740,
+    "export_bytes": 50212,
+    "export_sha256": "4551ecd6f9dc79b3dbbef76538363119504c21c09151ab3987fb4fb6ab0a8efe",
+    "context": 3,
+    "embedding": 8,
+    "hidden": 108,
+    "dense_macs_per_byte": 30240,
+    "mul1": 1523,
+    "shift1": 13,
+    "mul2": 3989,
+    "shift2": 14,
+    "pre2": 8,
+    "max_abs_dot1": 393216,
+    "max_abs_dot2": 56623104,
+    "max_scaled_dot1": 598867968,
+    "max_scaled_dot2": 882302976,
+    "notes": [
+      "Same trained int8 weights; transposed dense matrices and integer activation/probability arithmetic.",
+      "Not wire-compatible with the original float64 MCNN codec. Both peers need this PNN file.",
+      "Model and probability tables are pre-shared. Message length and integrity framing are external."
+    ],
+    "host_sample": {
+      "messages": 30,
+      "original_bytes": 1298,
+      "original_float64_model_bits_per_byte": 3.1365293355370576,
+      "integer_model_bits_per_byte": 3.136820468518135,
+      "integer_payload_bits_per_byte": 3.2295839753466873,
+      "all_round_trips_exact": true,
+      "seed": 42,
+      "note": "Sample from source corpus, may overlap training; not a held-out quality measurement."
+    }
+  },
+  "source_sha256": {
+    "nn_runtime.py": "d346d11bf240d16a536cd796719e5b119914180f8c011d311d533578b550346b",
+    "nn_codec.py": "1ea59808c192c80a75baa7c698fb10bb7c3674bf3fa887616286e2c133d50ddc",
+    "benchmark.py": "d8c054dfe123866a6abe864f9eef9eff271f731b678d5e331c69a8afc6844d4f"
+  },
+  "same_sample_host_baselines": {
+    "gzip_level9_bits_per_byte": 11.155624036979969,
+    "zlib_level9_bits_per_byte": 8.936825885978429,
+    "note": "Independent messages, standard wrappers, no shared dictionary. Host measurements of compressed sizes only."
+  }
+}
