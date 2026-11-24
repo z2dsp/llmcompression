@@ -10,3 +10,9 @@ demo-results.json
 data/
 models/
 *.mcb
+
+# Generated corpus exports and manifests written in the repository root.
+/*.jsonl
+/*.manifest.json
+*.swp
+*.swo

@@ -81,3 +81,9 @@ def test_body_falls_back_to_standard_text_jsonl(tmp_path):
     path = tmp_path / "plain.jsonl"
     path.write_text(json.dumps({"text": "hello\nworld"}) + "\n", encoding="utf-8")
     assert list(read_messages(path)) == ["hello\nworld"]
+
+def test_exclude_channels_keeps_private_and_unmapped_messages(database, tmp_path):
+    output = tmp_path / 'excluded.jsonl'
+    assert extract(database, output, exclude_channels=['#TEST'])['messages'] == 1
+    assert list(read_messages(output)) == [' Private\r\nmessage\x00']
+    assert extract(database, output, exclude_channels=['#unrelated'], overwrite=True)['messages'] == 4

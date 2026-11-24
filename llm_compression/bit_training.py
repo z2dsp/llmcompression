@@ -287,19 +287,24 @@ def train(args):
         raise FileExistsError(f"Output directory is not empty: {output}; choose a new output directory")
     output.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    prepared = args.input.is_dir() or args.input.name == "manifest.json"
-    if prepared:
-        if args.keep_duplicates or args.limit_messages is not None:
-            raise ValueError("Prepared splits already fix grouping; use --train-bytes for a development limit")
-        partitions, corpus_report = load_prepared(args.input, max_message_bytes=args.max_message_bytes)
-        input_path = Path(corpus_report["prepared_manifest"])
+    prepared = args.input.is_dir() or args.input.name == 'manifest.json'
+    if getattr(args, 'verification_input', None) is not None:
+        from .external_corpora import load_external
+        partitions, corpus_report, input_path = load_external(args)
     else:
-        partitions, corpus_report = split_corpus(
-            args.input, text_field=args.text_field, validation_fraction=args.validation_fraction,
-            test_fraction=args.test_fraction, split=args.split, seed=args.seed,
-            keep_duplicates=args.keep_duplicates, limit=args.limit_messages, max_message_bytes=args.max_message_bytes,
-        )
-        input_path = args.input
+        prepared = args.input.is_dir() or args.input.name == "manifest.json"
+        if prepared:
+            if args.keep_duplicates or args.limit_messages is not None:
+                raise ValueError("Prepared splits already fix grouping; use --train-bytes for a development limit")
+            partitions, corpus_report = load_prepared(args.input, max_message_bytes=args.max_message_bytes)
+            input_path = Path(corpus_report["prepared_manifest"])
+        else:
+            partitions, corpus_report = split_corpus(
+                args.input, text_field=args.text_field, validation_fraction=args.validation_fraction,
+                test_fraction=args.test_fraction, split=args.split, seed=args.seed,
+                keep_duplicates=args.keep_duplicates, limit=args.limit_messages, max_message_bytes=args.max_message_bytes,
+            )
+            input_path = args.input
     print(f"Training split: {len(partitions['train']):,} messages; model budget {args.model_kib} KiB, planned file at most {model_bytes:,} bytes.", file=sys.stderr)
     print(f"Counting with {args.workers} worker thread(s); at most {2 * args.workers if args.workers > 1 else 1} batches in flight.", file=sys.stderr)
     if args.train_bytes:
@@ -339,7 +344,7 @@ def train(args):
         actual = benchmark(evaluation["test"], model, args.benchmark_messages, args.seed)
         vectors = test_vectors(model)
         model_info = model.info()
-    if not prepared:
+    if not prepared and getattr(args, 'verification_input', None) is None:
         for name, messages in partitions.items():
             with (output / f"{name}.jsonl").open("x", encoding="utf-8") as stream:
                 for message in messages:
@@ -376,6 +381,7 @@ def build_parser(*, sweep=False):
         parser.add_argument("--model-kib", type=int, default=256, help="maximum binary model size in KiB, including its header; no software upper limit")
         parser.add_argument("--order", type=int, default=4, help="previous-byte context depth; any nonnegative integer, no software upper limit")
     parser.add_argument("--strengths", default="4,16,64,256,1024,4096", help="validation smoothing candidates (comma-separated)")
+    parser.add_argument('--verification-input', '--verification-corpus', type=Path, help='separate JSONL/CSV used exclusively for validation, test scoring and round trips')
     parser.add_argument("--text-field", choices=("body", "text"), default="body")
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)

@@ -40,13 +40,14 @@ def test_target_integer_frequencies_match_codec_including_ties(device):
 
 @pytest.mark.parametrize('context', [0, 3, 16])
 @pytest.mark.parametrize('storage', ['int8', 'float32'])
-def test_cuda_validation_scores_exported_weights_close_to_cpu_reference(tmp_path, context, storage):
+@pytest.mark.parametrize('hidden_layers', [1, 2, 3])
+def test_cuda_validation_scores_exported_weights_close_to_cpu_reference(tmp_path, context, storage, hidden_layers):
     require_torch('cuda')
-    hidden, _ = layout(8, context, 4, storage)
+    hidden, _ = layout(8, context, 4, storage, hidden_layers)
     rng = np.random.default_rng(10)
-    arrays = [rng.normal(0, 0.05, shape).astype('float32') for shape in shapes(context, 4, hidden)]
+    arrays = [rng.normal(0, 0.05, shape).astype('float32') for shape in shapes(context, 4, hidden, hidden_layers)]
     path = tmp_path / 'model.mcnn'
-    export_model(path, arrays, context, 4, hidden, storage)
+    export_model(path, arrays, context, 4, hidden, storage, hidden_layers)
     model = NeuralModel(path)
     messages = [b'', b'ab', b'c', 'Café 🌊'.encode(), bytes(range(256)), b'another message']
     reference = nn_training.evaluate(messages, model)
@@ -98,7 +99,7 @@ def test_cuda_checkpoint_selection_has_optional_cpu_reference_scores(tmp_path, m
                             '--model-kib', '4', '--context-bytes', '2', '--epochs', '3',
                             '--validate-every', '2', '--validation-device', 'cuda',
                             '--validation-batch-size', '17', '--evaluation-messages', '2',
-                            '--benchmark-messages', '1']
+                            '--benchmark-messages', '1', '--test-device', 'cpu']
     if skip_cpu_validation:
         args.append('--skip-cpu-validation')
     assert nn_training.main(args) == 0

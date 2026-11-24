@@ -16,9 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest==8.3.5"]
-sweep = ["matplotlib>=3.7,<4"]
+sweep = ["matplotlib>=3.9,<4"]
 mesh = ["meshcore==2.3.19"]
 wikipedia = ["pyarrow==23.0.1"]
+reddit = ["duckdb>=1.4,<3", "mistune>=3,<4"]
 
 [project.scripts]
 llm-compress = "llm_compression.cli:main"
@@ -27,8 +28,11 @@ llm-mesh-gui = "llm_compression.meshcore_app:gui_main"
 mesh-extract = "llm_compression.corpus:main"
 mesh-train = "llm_compression.bit_training:main"
 nn-train = "llm_compression.nn_training:main"
+nn-visualize = "llm_compression.nn_visualizer:main"
+nn-generate = "llm_compression.nn_generation:main"
 mcu-sweep = "llm_compression.bit_sweep:main"
 mcu-compress = "llm_compression.bit_codec:main"
+append-dailydialog = "llm_compression.dailydialog:main"
 prepare-wikipedia = "llm_compression.wikipedia:main"
 
 [tool.setuptools.packages.find]

@@ -1,6 +1,6 @@
 """Integer neural byte predictor for MicroPython, with a CPython reference path.
 
-PNN1 is deliberately distinct from the float64 MCNN codec. Both peers must use
+PNN is deliberately distinct from the float64 MCNN codec. Both peers must use
 the same PNN file and this integer probability allocation algorithm.
 """
 from array import array
@@ -50,8 +50,9 @@ if micropython is not None:
         count = int(p[0])
         multiplier = int(p[1])
         shift = int(p[2])
+        pre = int(p[3])
         for i in range(count):
-            index = ((int(h[i]) * multiplier) >> shift) + int(b[i])
+            index = (((int(h[i]) >> pre) * multiplier) >> shift) + int(b[i])
             if index < -2048:
                 index = -2048
             elif index > 2048:
@@ -121,12 +122,15 @@ class Model:
         if backend == 'viper' and micropython is None:
             raise ValueError('Viper requires MicroPython')
         with open(path, 'rb') as stream:
-            header = stream.read(HEADER_SIZE)
-            if len(header) != HEADER_SIZE:
-                raise ValueError('Truncated PNN header')
-            fields = struct.unpack(HEADER, header)
-            if fields[0] != b'MCPNN001':
+            magic = stream.read(8)
+            if magic not in (b'MCPNN001', b'MCPNN002', b'MCPNN003'):
                 raise ValueError('Unsupported PNN format')
+            self.hidden_layers = magic[-1] - 48
+            header_size = HEADER_SIZE + 12 * (self.hidden_layers - 1)
+            header = magic + stream.read(header_size - 8)
+            if len(header) != header_size:
+                raise ValueError('Truncated PNN header')
+            fields = struct.unpack('<8s' + str(8 + 3 * (self.hidden_layers - 1)) + 'I32s', header)
             (self.context, self.embedding, self.hidden, self.mul1, self.shift1,
              self.mul2, self.shift2, self.pre2) = fields[1:9]
             if self.context < 1 or self.embedding < 1 or self.hidden < 1:
@@ -140,7 +144,15 @@ class Model:
             if (max(max1, max2) >= 2**30 or max1 * self.mul1 >= 2**30
                     or ((max2 + (1 << self.pre2) - 1) >> self.pre2) * self.mul2 >= 2**30):
                 raise ValueError('PNN scaling exceeds signed Viper accumulator bounds')
-            digest = hashlib.sha256(header[:40])
+            self.middle_parameters = []
+            for index in range(self.hidden_layers - 1):
+                mul_mid, shift_mid, pre_mid = fields[9 + 3 * index:12 + 3 * index]
+                if not (0 < mul_mid < 2**30 and 0 <= shift_mid <= 24 and 0 <= pre_mid <= 24):
+                    raise ValueError('Invalid PNN middle scaling')
+                if ((max2 + (1 << pre_mid) - 1) >> pre_mid) * mul_mid >= 2**30:
+                    raise ValueError('PNN middle scaling exceeds signed Viper accumulator bounds')
+                self.middle_parameters.append(array('i', [self.hidden, mul_mid, shift_mid, pre_mid]))
+            digest = hashlib.sha256(header[:-32])
 
             def read(size):
                 block = stream.read(size)
@@ -152,6 +164,10 @@ class Model:
             self.embeddings = read(257 * self.embedding)
             self.w1 = read(self.context * self.embedding * self.hidden)
             self.b1 = array('i', read(self.hidden * 4))
+            self.middle_weights, self.middle_biases = [], []
+            for _ in range(self.hidden_layers - 1):
+                self.middle_weights.append(read(self.hidden * self.hidden))
+                self.middle_biases.append(array('i', read(self.hidden * 4)))
             self.w2 = read(self.hidden * 256)
             self.b2 = array('i', read(256 * 4))
             self.tanh = array('h', read(4097 * 2))
@@ -162,13 +178,15 @@ class Model:
         self.dot = _dot_viper if backend == 'viper' else _dot_python
         self.x = array('i', [0] * (self.context * self.embedding))
         self.h = array('i', [0] * self.hidden)
+        self.h2 = array('i', [0] * self.hidden) if self.hidden_layers >= 2 else self.h
+        self.output_hidden = self.h if self.hidden_layers % 2 else self.h2
         self.logits = array('i', [0] * 256)
         self.scores = array('i', [0] * 256)
         self.remainders = array('i', [0] * 256)
         self.cumulative = array('i', [0] * 257)
         self.workspace = array('i', [0] * 1025)
         self.viper_cdf = memoryview(self.workspace)[768:]
-        self.hidden_parameters = array('i', [self.hidden, self.mul1, self.shift1])
+        self.hidden_parameters = array('i', [self.hidden, self.mul1, self.shift1, 0])
         self.frequency_parameters = array('i', [self.mul2, self.shift2, self.pre2])
         self.frequency_parameters.extend(self.b2)
         self.indices = list(range(256))
@@ -187,14 +205,17 @@ class Model:
             for col in range(self.embedding):
                 self.x[start + col] = self.embeddings[offset + col] - 128
 
-    def hidden_activation(self):
+    def hidden_activation(self, values=None, biases=None, parameters=None):
+        values = self.h if values is None else values
+        biases = self.b1 if biases is None else biases
+        parameters = self.hidden_parameters if parameters is None else parameters
         if self.backend == 'viper':
-            _hidden_viper(self.h, self.b1, self.tanh, self.hidden_parameters)
+            _hidden_viper(values, biases, self.tanh, parameters)
             return
         for i in range(self.hidden):
-            index = ((self.h[i] * self.mul1) >> self.shift1) + self.b1[i]
+            index = (((values[i] >> parameters[3]) * parameters[1]) >> parameters[2]) + biases[i]
             index = min(2048, max(-2048, index)) + 2048
-            self.h[i] = self.tanh[index]
+            values[i] = self.tanh[index]
 
     def frequencies(self):
         if self.backend == 'viper':
@@ -235,8 +256,17 @@ class Model:
         self.features(history)
         self.dot(self.w1, self.x, self.h, len(self.x))
         self.hidden_activation()
-        self.dot(self.w2, self.h, self.logits, self.hidden)
+        self.middle_layer()
+        self.dot(self.w2, self.output_hidden, self.logits, self.hidden)
         return self.frequencies()
+
+    def middle_layer(self):
+        # Alternate two buffers; the third layer reuses the first layer's RAM.
+        source, target = self.h, self.h2
+        for index in range(self.hidden_layers - 1):
+            self.dot(self.middle_weights[index], source, target, self.hidden)
+            self.hidden_activation(target, self.middle_biases[index], self.middle_parameters[index])
+            source, target = target, source
 
 
 def advance(history, byte):

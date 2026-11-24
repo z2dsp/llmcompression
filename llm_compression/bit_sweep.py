@@ -121,11 +121,13 @@ def main(argv=None):
                   for key, value in vars(args).items()
                   if key not in ('output', 'resume', 'plot_only', 'model_kib', 'order')}
         config['input_sha256'] = file_sha256(source)
+        if args.verification_input is not None:
+            config['verification_sha256']=file_sha256(args.verification_input)
         manifest = output / 'sweep.json'
         if output.exists() and any(output.iterdir()):
             if not args.resume:
                 raise ValueError('Output is not empty; use --resume or choose a new --output')
-            if not manifest.exists() or json.loads(manifest.read_text(encoding='utf-8')) != config:
+            if not manifest.exists() or {'verification_input':None, **json.loads(manifest.read_text(encoding='utf-8'))} != config:
                 raise ValueError('Resume configuration/corpus differs; choose a new --output')
         output.mkdir(parents=True, exist_ok=True)
         manifest.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
@@ -146,7 +148,8 @@ def main(argv=None):
                     with BitModel(directory / 'model.mcblm') as model:
                         if (model.sha256 != report['model']['sha256'] or model.order != order
                                 or report['requested_model_kib'] != size
-                                or report['corpus']['sha256'] != config['input_sha256']):
+                                or report['corpus']['sha256'] != config['input_sha256']
+                                or report['corpus'].get('verification',{}).get('sha256') != config.get('verification_sha256')):
                             raise ValueError(f'Completed run does not match configuration: {directory}')
                 else:
                     if directory.exists() and any(directory.iterdir()):

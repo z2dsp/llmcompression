@@ -58,3 +58,30 @@ def test_rejects_invalid_symbols_and_reuse():
         encoder.write([0, 1], 0)
     with pytest.raises(ValueError):
         encoder.finish()
+
+
+@pytest.mark.parametrize('middle_only', [False, True])
+def test_finished_size_matches_every_prefix_without_finalizing(middle_only):
+    rng = random.Random(91)
+    encoder = ArithmeticEncoder()
+    sequence = []
+    for index in range(81):
+        reference = ArithmeticEncoder()
+        for cdf, symbol in sequence:
+            reference.write(cdf, symbol)
+        expected_size = len(reference.finish())
+        assert encoder.finished_size() == expected_size
+        # Repeated size queries must not finalize or change the active coder.
+        assert encoder.finished_size() == expected_size
+        if index < 80:
+            if middle_only:
+                cdf, symbol = [0, 1, 3, 4], 1  # Accumulate deferred underflow bits.
+            else:
+                cdf = [0]
+                for _ in range(8):
+                    cdf.append(cdf[-1] + rng.randrange(1, 1000))
+                symbol = rng.randrange(8)
+            encoder.write(cdf, symbol)
+            sequence.append((cdf, symbol))
+    expected = encoder.finished_size()
+    assert len(encoder.finish()) == encoder.finished_size() == expected

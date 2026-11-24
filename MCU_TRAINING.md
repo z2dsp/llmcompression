@@ -44,6 +44,57 @@ Share a trained model deliberately: learned frequency tables are not a privacy
 guarantee. To exclude private conversations, extract with `--type channel` before
 training.
 
+## Add DailyDialog utterances to the combined corpus
+
+From the project directory, run this standard-library-only importer:
+
+```bash
+python append_dailydialog.py
+# Reuse the downloaded archive without network access:
+python append_dailydialog.py --offline
+# Optional separate destination:
+python append_dailydialog.py --corpus data/another-combined.jsonl
+```
+
+It downloads the pinned [ConvLab/DailyDialog dataset](https://huggingface.co/datasets/ConvLab/dailydialog)
+(about 3.7 MB), verifies its SHA-256, and reads the dialogue JSON directly from
+`data/dailydialog/raw/data.zip`. Every utterance becomes a JSONL record with
+`body`, `source`, `source_id`, `source_split`, `dialogue_id`, and `utterance_index`.
+The trainers already read `body` by default; no conversion is needed. Text is
+preserved exactly as supplied by ConvLab, including repeated utterances.
+
+All **102,979 utterances** are included: 87,170 train, 8,069 validation, and 7,740
+test. Stable source IDs prevent duplicate appends on reruns. A changed body for an
+existing ID aborts the import. Existing corpus bytes are preserved, with a final
+newline added if needed before the new records. Before replacing an existing
+corpus, the script creates a sibling `*.before-dailydialog-<id>.bak` backup. It
+stages the complete result before replacing the corpus atomically.
+
+The default destination is `data/combined-messages.jsonl`. `--cache-dir` changes
+where the archive and provenance metadata are stored; `--report` overrides the
+default `data/dailydialog/append-report.json` import report. No extra packages or
+remote dataset code are required. Downloads, imported data, reports, and backups
+remain under Git-ignored `data/` by default.
+
+For combined-source neural training, use a fresh output directory and a random
+split so the file's source ordering does not determine the held-out sets:
+
+```bash
+.venv-cuda/bin/python train_nn_cuda.py data/combined-messages.jsonl \
+  --model-kib 1024 --context 3 --split random \
+  --output models/nn-combined-dailydialog-1024k
+```
+
+The trainer does not use `source_split`: importing all three DailyDialog splits
+means its original test/validation sets are no longer untouched evaluation data.
+Random splitting also allows related turns from one dialogue into different
+splits; use an independently held-out conversation corpus for final evaluation.
+
+DailyDialog is by Yanran Li et al. (IJCNLP 2017), with this version transformed by
+Qi Zhu for ConvLab. The dataset card specifies **CC BY-NC-SA 4.0** (attribution,
+noncommercial, share-alike). Source, immutable revision, license link, and paper
+are recorded in `data/dailydialog/source.json`.
+
 ## Train on a desktop
 
 Training requires NumPy; it does not use PyTorch or download a model:
@@ -577,11 +628,31 @@ The installed equivalent command is `mcu-sweep`.
 
 `train_nn_compression_model.py` trains a byte-level neural network with an exact,
 finite context window. It embeds each of the preceding bytes (plus BOS=256),
-flattens those position-specific embeddings, applies a tanh hidden layer, and
-predicts a 256-way next-byte distribution. It has no recurrent state or tokenizer.
-The hidden width is automatically chosen to fit `--model-kib`, counting the whole
-portable binary: header, embeddings, both dense layers, biases, and quantization
-scales. Context zero is supported as an unconditional neural baseline.
+flattens those position-specific embeddings, applies three equal-width tanh hidden
+layers, and predicts a 256-way next-byte distribution. It has no recurrent state
+or tokenizer. The largest hidden width that fits `--model-kib` is chosen using
+integer arithmetic, counting the whole portable binary: header, embeddings,
+all four dense matrices, biases, and per-tensor quantization scales. The middle
+matrices grow quadratically with width; all hidden layers are narrowed to stay
+within the same budget. Context zero remains an unconditional neural baseline.
+
+Three hidden layers are the default for all neural training entry points and
+CUDA sweeps. Use `--hidden-layers 1` or `--hidden-layers 2` to reproduce an earlier
+architecture. New three-layer files use `MCNNLM03`; the loader still reads
+existing `MCNNLM01` and `MCNNLM02` files without changing their predictions.
+Reports record `hidden_layers` and the per-layer `hidden_dim`. Select a fresh
+output directory for the new architecture; resume an existing sweep with its
+original options plus the matching `--hidden-layers 1` or `--hidden-layers 2`.
+
+The Pico exporter and the Python/C integer runtimes also support all three
+depths: `MCPNN001`, `MCPNN002`, and `MCPNN003` carry the respective matrices,
+biases, and fixed-point scaling. Two- and three-layer inference alternate two
+activation buffers; layer three reuses layer one's RAM. Both peers need the
+same model and a runtime that supports its format. The training budget constrains `.mcnn` size;
+the MCU `.pnn` conversion additionally stores lookup tables and wider biases,
+so its file size is larger. Firmware RAM/flash limits are checked separately.
+Changing depth does not establish better compression; compare held-out loss at
+the same model budget.
 
 Use Python with NumPy and PyTorch installed. On this Windows machine, `python`
 resolves to Inkscape's bundled runtime; use the separate Python 3.11 executable:
@@ -608,6 +679,7 @@ Important controls:
 
 - `--context-bytes N` (alias `--order`): preceding UTF-8 bytes, reset per record.
 - `--model-kib N`: maximum complete exported file size in KiB, not a RAM limit.
+- `--hidden-layers {1,2,3}`: number of equal-width tanh hidden layers; default 3.
 - `--storage int8` (default) or `float32`: export representation. Training uses
   float32; int8 uses one scale per tensor and validation selects epochs after
   quantization. Embedding dimension defaults to 8; use `--embedding-dim` to vary it.
@@ -617,12 +689,16 @@ Important controls:
 - `--early-stopping-min-delta D`: minimum significant validation loss decrease in
   bits/byte; default `0` accepts any strict decrease. The best checkpoint still
   includes smaller improvements.
-- `--device cuda`: require GPU training; the default `auto` selects CUDA when
-  available, otherwise CPU. Validation defaults to the NumPy CPU reference;
-  `--validation-device cuda` enables batched GPU checkpoint selection. Final
-  test/coding checks use the CPU reference.
-- `--skip-cpu-validation`: omit the final CPU validation pass after GPU selection;
-  requires `--validation-device cuda`. CPU test scoring and coding checks still run.
+- `--device cuda`: require GPU training; the ordinary trainer's default `auto`
+  selects CUDA when available. The ordinary trainer defaults to CPU validation;
+  `train_nn_cuda.py` and `sweep_nn_cuda.py` default to FP32 CUDA validation and
+  skip the final CPU reference validation pass.
+- `--skip-cpu-validation` / `--no-skip-cpu-validation`: omit/restore the final CPU
+  validation pass after GPU selection. Skipping requires CUDA validation.
+- `--test-device auto|cpu|cuda`: test scoring; `auto` follows the validation device.
+  CPU arithmetic round-trip checks still run on the benchmark sample.
+- `--cuda-chunk-bytes N`: compact input chunk size (default 1 MiB), aligned to
+  whole optimizer batches. Context tensors are assembled on the GPU per batch.
 - `--validate-every N`: validate and export every N epochs (default 1), always
   including the final epoch. Only validated epochs compete for the best model.
 - `--train-bytes`: cap whole training messages per epoch; the same prefix is used
@@ -664,6 +740,108 @@ for CPU inference; training/optimizer memory and inference RAM exceed the stored
 file size. Cross-platform floating-point probability agreement is not guaranteed;
 use matching runtimes and the test vectors when developing a native decoder.
 
+### Generate a continuation
+
+Use a trained `.mcnn` model for greedy generation or temperature sampling:
+
+```bash
+.venv/bin/python generate_nn.py models/my-neural-model/model.mcnn \
+  "Hello from the mesh" --bytes 200
+
+# Sample alternatives to the most likely byte; the seed makes the run repeatable.
+.venv/bin/python generate_nn.py models/my-neural-model/model.mcnn \
+  "Hello from the mesh" --bytes 200 --temperature 0.8 --seed 42
+
+# Save the prompt plus 200 new bytes exactly, without UTF-8 display replacement.
+.venv/bin/python generate_nn.py models/my-neural-model/model.mcnn \
+  "Hello from the mesh" --bytes 200 --output generated.txt
+```
+
+The initial text context is a quoted positional argument. Omit it (or pass an
+empty string) to start with BOS padding. `--bytes` counts newly generated bytes,
+excluding the initial context; its default is 256. `--continuation-only` omits the
+prompt from the output while still using it to initialize the model's history.
+The model uses only its configured number of preceding UTF-8 bytes and fills
+missing context with BOS, matching compression. Longer prompts are printed in
+full but only their final context window affects predictions.
+
+`--temperature 0` (the default) uses the maximum raw logit before codec
+probability quantization, with the lower byte value breaking exact ties.
+Positive temperatures sample from `softmax(logits / temperature)`: values below
+1 concentrate probability on likely bytes, 1 uses the model's distribution,
+and values above 1 spread probability more evenly. Sampling allows alternatives
+to the greedy choice, helping escape deterministic loops; repetitions can still
+occur. `--seed N` reproduces sampling choices for the same model, context,
+temperature, and runtime. Omit it for a fresh random seed. Temperature must be
+finite and nonnegative, and seeds must be nonnegative integers.
+
+Each chosen byte is fed back into the context. There is no repetition penalty,
+UTF-8 filter, or end-of-text token; it generates the requested number of new
+bytes. All one-, two-, and three-hidden-layer `.mcnn` files are supported, with
+either int8 or float32 storage; inference needs only NumPy on CPU.
+
+Terminal output is streamed with incremental UTF-8 decoding, so multibyte
+characters are displayed correctly. Invalid sequences or an incomplete final
+character appear as replacement characters for display only. `--output PATH`
+preserves the exact bytes, refuses to overwrite existing files, and sends no
+text to stdout. No newline is appended automatically. The installed equivalent
+is `nn-generate`; `python -m llm_compression.nn_generation` also works.
+
+### Visualize neural activations
+
+The basic desktop viewer loads trained `.mcnn` models with one, two, or three
+hidden layers. It uses NumPy and Tkinter on CPU; PyTorch and CUDA are not needed.
+The exported int8 weights are dequantized using the same reference loader as the
+compression codec. This viewer inspects `.mcnn` files, not the MCU `.pnn` format
+or Hugging Face checkpoints.
+
+```bash
+# Open the GUI and choose a trained model.
+.venv/bin/python visualize_nn.py
+
+# Open a particular model and start partway through a message.
+.venv/bin/python visualize_nn.py models/my-neural-model/model.mcnn \
+  --text "Hello from the mesh!" --position 5
+```
+
+The installed command is `nn-visualize` (reinstall the editable package to add
+new entry points). `python -m llm_compression.nn_visualizer` also works. A desktop
+display is required. If Tkinter is missing on Debian/Ubuntu, install `python3-tk`.
+
+- Browse/Load selects the model; the header shows its size and architecture.
+- Editing the message updates the view automatically. Previous/Next, the byte
+  slider, and the position box choose the next byte to predict. Position zero
+  uses BOS padding; the final position predicts beyond the input. Play animates
+  the byte positions, with a configurable delay. UTF-8 characters can span
+  several steps: the predictor operates on bytes rather than characters.
+- Blue is a negative activation, amber is positive, and dark is near zero.
+  Hidden tanh layers always use the fixed -1 to +1 scale. Embedding colors are
+  normalized to their largest absolute value in each frame; output green is
+  normalized to the largest next-byte probability in that frame.
+- Hover over a tile for its exact activation and pre-tanh value, embedding
+  coordinate, or byte probability. Large layers group consecutive units up to
+  the selected tile limit; a group shows its strongest absolute activation,
+  with its sign retained. Hover reveals the range, peak unit, mean, and extrema.
+  Grouping affects only drawing; every neuron is evaluated.
+- The sidebar lists the most likely next bytes and highlights the actual next
+  byte. Its probabilities and bit cost use the codec's integer frequency table;
+  output hover also shows the original softmax probability and logit. Predictions
+  use preceding input only; the actual next byte is used only for comparison.
+- The bold cost line sums the coding cost of the message prefix, including the
+  selected byte, and shows bits and equivalent fractional bytes. Position zero
+  includes the first byte; the final position shows the complete message cost.
+  The selected byte's individual cost is still shown above it. The cumulative
+  cost is the sum of `-log2(codec probability)` for the included bytes.
+- "Payload if ended here" is the actual arithmetic payload length for that
+  prefix, including termination and byte padding. It excludes framing and the
+  shared model. Empty input has zero probability cost, but its terminated
+  arithmetic payload still occupies one byte. Prefix totals are cached for
+  playback and navigation and reset whenever the model or message changes.
+
+The viewer does not save entered messages or change model files. Loading and
+inference run in a worker thread so the window remains responsive. The network
+arrows show layer order; they do not represent individual synaptic weights.
+
 ### Pico W MicroPython inference
 
 The [Pico demo](pico/README.md) implements a separate integer inference format
@@ -674,6 +852,25 @@ benchmarked on the connected Pico W: about 27 ms per byte prediction and
 50,212 flash bytes, with a measured 63,280-byte inference heap delta.
 The Pico payloads agree exactly with its desktop integer reference, but are not
 compatible with the original float64 `.mcnn` runtime.
+
+### PY32F403 native inference
+
+The [PY32F403 firmware](py32f403/README.md) runs the same integer model and
+arithmetic payload format in native C on a PY32F403V1DT6. All model tensors and
+lookup tables remain in flash; NN working state is 2,836 bytes. The complete
+application reserves 14,888 bytes of its 64 KiB SRAM, including an 8 KiB stack
+budget. At nominal 144 MHz it measured 3.20 ms per prediction and about 333
+original bytes/s encoding/decoding. Payloads match the Pico and desktop integer
+codec exactly. Python tools build, back up, program, verify, and benchmark the
+device through ST-Link and the Pico W UART bridge on GPIO0/GPIO1.
+
+The same target was also flashed with the 64 KiB/context-3 model: prediction
+measured 5.47 ms/byte, encoding/decoding about 188 original bytes/s, and the same
+30-message sample improved from 3.23 to 2.94 payload bits/byte. It reserves
+15,120 RAM bytes including the 8 KiB stack budget, with 3,068 bytes of NN working
+state. Firmware size is 90,672 flash bytes. The 64 KiB model is currently on the
+device; [reproduction commands and comparison](py32f403/README.md#reproduce-the-64-kibcontext-3-run)
+preserve the original 32 KiB build and measurements.
 
 ### CUDA training on Linux (this machine)
 
@@ -713,11 +910,10 @@ wheel supplies its CUDA runtime libraries. These scripts do not compile CUDA
 code or require a separate CUDA toolkit installation. The environment and its
 package cache are ignored by Git.
 
-Training uses CUDA; exported-model validation defaults to the NumPy CPU reference,
-with optional batched GPU validation described below. Final reference validation,
-test scoring, and arithmetic round trips use CPU. Low GPU utilization during
-those CPU stages is expected. Reports record the actual training device, GPU name, CUDA version,
-and peak allocated GPU memory. The CUDA launcher requests CUDA explicitly and
+The CUDA launcher defaults to FP32 GPU training, exported-model validation, and
+test scoring, skipping final CPU reference validation. Exact arithmetic round
+trips still use a sampled CPU reference check. Reports record the actual training
+device, GPU name, precision, CUDA version, and peak allocated GPU memory. The CUDA launcher requests CUDA explicitly and
 reports an error if it is unavailable, rather than silently using CPU.
 
 Setup verification passed all 15 neural-model and launcher tests, including
@@ -729,9 +925,69 @@ GPU bytes. The model/report are in `models/nn-linux-cuda-smoke-6m78_mfq/`;
 this short run verifies the environment, not final compression quality.
 An installed-package snapshot is saved in `.cache/nn-cuda-installed.txt`.
 
-### CUDA training throughput
+### FP32 GPU training and scoring
 
-The trainer packs message bytes into bounded batches and constructs preceding-byte
+The CUDA launcher and CUDA sweeps now use FP32 for gradient training, exported
+model validation, test scoring, softmax, and metric reductions. No FP64 tensors
+or arithmetic are used on CUDA. TF32 remains disabled. Exported model size,
+int8/float32 storage options, hidden-layer count, and codec format are unchanged.
+
+```bash
+.venv-cuda/bin/python train_nn_cuda.py data/combined-messages.jsonl \
+  --model-kib 1024 --context-bytes 3 --split random --epochs 30 \
+  --output models/nn-combined-fp32-1024k-c3
+```
+
+CUDA batches upload compact bytes and per-byte message positions in bounded
+chunks, then build preceding-byte contexts and shuffle batch rows on the GPU.
+History survives chunk boundaries but resets at every message/record boundary.
+Prepared Wikipedia input continues to stream; the whole corpus and all expanded
+contexts need not fit in GPU memory. A fixed-size FP32 reduction buffer with
+compensated block sums avoids the cumulative drift of a single FP32 loss scalar
+on long training runs. CUDA shuffling is seeded, but need not reproduce model
+hashes from older CPU-side shuffling. Batch size and training data order are
+otherwise preserved. Increase `--batch-size` explicitly for more GPU work per
+step, and compare validation quality because that changes optimization.
+
+GPU scoring uses **exported, quantized/dequantized weights** and the codec's
+integer frequency allocation, rather than the training loss. FP32 rounding can
+change individual frequencies and checkpoint selection slightly. GPU scores are
+estimates for the existing CPU decoder. CPU validation can be restored with
+`--no-skip-cpu-validation`, and `--test-device cpu` restores CPU test scoring.
+For all CPU scoring, use `--validation-device cpu --no-skip-cpu-validation
+--test-device cpu`. The generic `train_nn_compression_model.py` keeps its CPU
+validation default. Exact CPU compression/decompression checks remain limited
+to `--benchmark-messages` (default 100); they and the published test vectors
+still use the original NumPy float64 reference codec. No MCU runtime change is
+required.
+
+A local RTX 3070 comparison used a 1 MiB int8 export budget, three hidden layers,
+context 3, batch size 1024, and 1,048,541 training bytes. Median training time for
+the two warmed epochs changed from **1.579 s to 1.541 s**. The main improvement
+was scoring the same exported model on 1,000 held-out messages (64,478 bytes):
+
+| Scoring implementation | Median seconds | Bits/UTF-8 byte |
+| --- | ---: | ---: |
+| Previous CUDA FP64 | 0.5622 | 2.636799576 |
+| Current CUDA FP32 | 0.02766 | 2.636799325 |
+| CPU codec reference (one timing) | 8.961 | 2.636799576 |
+
+FP32 GPU scoring was about **20 times faster** than FP64 GPU scoring in this
+sample, with a difference of about **0.00000025 bits/byte** from the CPU
+reference. This is a short local benchmark, not a convergence study or a speed
+guarantee for every configuration. Details are saved in
+`models/nn-fp32-performance/benchmark.json`. A fused Adam experiment was slower
+for this workload, so the existing Adam implementation is retained.
+
+Reports include training/validation/test precision, test scoring device, input
+pipeline version, phase timings, and per-epoch throughput. New sweeps use format
+`nn-cuda-sweep-v2-fp32`, preventing old FP64 scoring results from being silently
+mixed into an FP32 run. Start a fresh output directory for a new sweep; old
+results remain available through `--plot-only`.
+
+### Earlier CUDA training throughput measurements
+
+The earlier trainer packed message bytes into bounded batches and constructs preceding-byte
 contexts with NumPy array operations. It preserves message boundaries, BOS padding,
 batch boundaries, and seeded shuffling. It no longer creates a Python history list
 for each byte. Input transfers use nonblocking CUDA copies with distinct source
@@ -779,8 +1035,9 @@ export, validation, test scoring, and the coding benchmark. The existing outer
 include the training phase time and throughput when available; older reports
 without these measurements can still be resumed.
 
-Default validation, final test scoring, and arithmetic coding use the NumPy CPU
-reference and can leave the GPU idle. A small network can also be limited by
+Those earlier runs used CPU validation, test scoring, and arithmetic coding.
+Current CUDA launchers use FP32 GPU validation/test scoring by default, while
+arithmetic coding remains a sampled NumPy CPU reference check. A small network can also be limited by
 kernel launch overhead. Judge improvements by training bytes/second and total
 run time, as well as GPU utilization.
 
@@ -851,20 +1108,21 @@ This validates at epochs 5, 10, 15, and 20. The final epoch is always checked,
 even when it is not a multiple of the interval or the interval exceeds the total
 epoch count. Skipped epochs do not export a candidate and have `validation: null`
 in `epochs.json`. They cannot be selected as best, so a wider interval can miss
-a better intermediate model. Defaults remain validation every epoch on CPU.
+a better intermediate model. Validation runs every epoch by default. The CUDA
+launcher defaults to GPU validation; the generic trainer defaults to CPU.
 
 `--validation-device cuda` batches byte contexts and scores the **exported**
-model, including int8 quantization, using float64 dequantized weights on the GPU.
+model, including int8 quantization, using FP32 dequantized weights on the GPU.
 It uses the codec's integer frequency allocation and byte-value tie breaking;
-it does not substitute the training network's softmax loss. Float64 CPU/GPU
-matrix calculations can still round differently, as explained in
+it does not substitute the training network's softmax loss. CPU/GPU precision
+and matrix calculations can round differently, as explained in
 [PyTorch's numerical accuracy notes](https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html).
 GPU validation is therefore a checkpoint-selection estimate, with possible tiny
 differences from the reference coding loss. Reduce `--validation-batch-size` if
 the GPU evaluation needs too much memory; this is independent of training batch
 size. Explicit CUDA validation fails if no CUDA device is available.
 
-A warmed local RTX 3070 comparison scored the same 1,000 held-out messages
+An earlier FP64 GPU comparison scored the same 1,000 held-out messages
 (50,072 bytes) with a 256 KiB/context-16 exported model. CPU reference scoring
 took **3.70 seconds**, versus **0.158 seconds on CUDA**, about **23 times faster**.
 The scores differed by about `6e-14` bits/byte in that sample. This is a single
@@ -872,10 +1130,11 @@ local measurement with `OPENBLAS_NUM_THREADS=1`; rounding agreement and speed
 are not guaranteed for other models or hardware. Details are recorded in
 `models/nn-validation-benchmark.json`.
 
-By default after GPU selection, the chosen model gets **one CPU reference validation pass**.
-Final test scoring and exact compression round trips also remain on CPU. These
-checks can still take time, but they run once per training run instead of every
-epoch. With CPU selection, the previously computed validation result is reused.
+The generic trainer performs one CPU reference validation pass after GPU
+selection unless `--skip-cpu-validation` is set. CUDA launchers skip it by default;
+use `--no-skip-cpu-validation` to restore it. Test scoring follows the validation
+device unless `--test-device` overrides it. Exact compression round trips remain
+on CPU. With CPU selection, the existing validation result is reused.
 
 To skip that extra CPU validation pass, add `--skip-cpu-validation` together with
 `--validation-device cuda`. For the prepared Wikipedia corpus, for example:
@@ -888,10 +1147,10 @@ OPENBLAS_NUM_THREADS=1 .venv-cuda/bin/python train_nn_cuda.py data/wikipedia/pre
 ```
 
 GPU validation and early stopping continue normally. Only the final reference
-validation pass is omitted; CPU test scoring and exact compression round trips
-still run. The flag requires CUDA validation, and is also accepted by
-`sweep_nn_cuda.py`. It defaults to disabled, so older sweeps remain resumable
-with their original settings.
+validation pass is omitted; test scoring and exact compression round trips
+still run. The flag requires CUDA validation and is enabled by default in
+`train_nn_cuda.py` and `sweep_nn_cuda.py`. See the FP32 workflow above for current
+sweep compatibility and CPU reference options.
 
 `report.json` stores the CPU reference score in `validation` and the score used
 to choose the checkpoint in `selection_validation`. Per-epoch scores use the
@@ -904,9 +1163,9 @@ reference when available, otherwise the CUDA selection estimate. The
 `validation_score_device` column identifies the metric's source, and plots with
 CUDA scores label them as estimates. Selection score/device are also recorded.
 
-Both validation controls work with `sweep_nn_cuda.py`. Existing default CPU
-sweeps can still be resumed; changing the validation interval or device requires
-a fresh output directory. `--evaluation-messages` can also reduce scoring time
+Both validation controls work with `sweep_nn_cuda.py`. Start a new output
+directory when moving an older sweep to the FP32 backend or changing validation
+settings. New FP32 sweeps support `--resume` with matching settings. `--evaluation-messages` can also reduce scoring time
 by using a smaller held-out sample, at the cost of a noisier model comparison.
 
 ### Sweep CUDA neural model sizes and contexts
@@ -932,7 +1191,7 @@ with the size budget. Pairs that cannot fit even one hidden unit are recorded
 as skipped. CUDA is required for training; the sweep does not fall back to CPU.
 
 The sweep accepts the neural trainer's other training/corpus options, including
-`--storage`, `--embedding-dim`, `--batch-size`, `--learning-rate`, `--threads`,
+`--storage`, `--embedding-dim`, `--hidden-layers`, `--batch-size`, `--learning-rate`, `--threads`,
 `--seed`, split controls, `--limit-messages`, and evaluation/benchmark limits.
 All cells use the same split, seeds, samples, and training settings. Each cell
 runs sequentially in its own process, releasing its GPU allocations when it
@@ -980,39 +1239,9 @@ use fresh traffic for a final measurement. Percentages exclude the shared model
 and radio overhead; framed sizes use the trainer's existing nonce/length/CRC
 estimate.
 
-### CUDA training on Windows (the other computer)
+### CUDA training on Windows (the RTX 3070 computer)
 
-The neural trainer defaults to `--device auto`: CUDA is selected when PyTorch
-can access a GPU, otherwise CPU. `--device cuda` requires a working CUDA runtime
-and fails with an installation/driver diagnostic if it is unavailable.
-
-Use the same Python for installation and training. In PowerShell, with the
-Python 3.11 installation used in this project:
-
-```powershell
-$py = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
-& $py -m pip install --upgrade torch==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
-& $py -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-& $py train_nn_compression_model.py data/messages.jsonl --device cuda --context-bytes 16 --model-kib 256 --epochs 10 --output models/nn-mesh-cuda-256k-c16
-```
-
-The official [PyTorch installation table](https://pytorch.org/get-started/previous-versions/)
-lists CUDA 12.4 wheels for the project's pinned PyTorch 2.5.1. The Windows machine's
-NVIDIA driver 552.44 reports CUDA 12.4 support. A `+cpu` PyTorch build cannot use
-the RTX 3070 even when `nvidia-smi` detects it. `python` on that machine points
-to Inkscape's Python; use the explicit `$py` above.
-
-Training runs on the selected device. Checkpoint validation can use CUDA with
-`--validation-device cuda`. Final validation (unless skipped), test scoring, and arithmetic round
-trips use the NumPy CPU reference so final compression metrics describe that
-decoder. Low GPU utilization during those CPU stages is expected. Reports record the actual training device,
-GPU name, CUDA version, and peak allocated GPU memory. Set `--device cpu` to
-force CPU training.
-
-On the Windows machine C: had insufficient free space for the CUDA wheel plus its
-installed libraries. The CUDA build is therefore installed under the ignored
-`.cache/cuda-runtime` directory on the project share. Use this launcher with
-Windows Python 3.11 to select that runtime for this process only:
+Use Windows Python 3.11 and the dedicated CUDA launcher:
 
 ```powershell
 $py = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
@@ -1020,18 +1249,317 @@ $py = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
 & $py train_nn_cuda.py data/wikipedia/prepared --context-bytes 16 --model-kib 256 --epochs 10 --output models/nn-wikipedia-gpu-256k-c16
 ```
 
-The CUDA launcher accepts the same options as the regular neural trainer and
-selects CUDA explicitly. The ordinary Python installation retains its CPU build;
-use the launcher to load the project-local GPU build. No shell activation is
-required. The cached runtime is machine-specific and is not committed to Git.
-The project-local CUDA runtime can be recreated with:
+The launcher loads the GPU runtime from
+`%LOCALAPPDATA%/llm-compression/cuda-2.5.1-cu124-py311`. Windows denied loading
+DLLs from this network share, so runtime libraries must be local. Large DLLs
+use Windows LZX compression to fit on the crowded system drive. The verified
+wheel download stays under `.cache/cuda-wheels` on the share; system PyTorch
+is left unchanged. To recreate the installation:
 
 ```powershell
 & $py install_nn_cuda.py
 ```
 
-This helper downloads the Windows Python 3.11 PyTorch 2.5.1 CUDA 12.4 wheel from
-the official PyTorch index, verifies its published SHA-256, and extracts it into
-`.cache/cuda-runtime`. It uses large buffered reads/writes for the network share
-and leaves the system PyTorch installation unchanged. The project's existing
-Python installation supplies NumPy and PyTorch's Python dependencies.
+The installer obtains the official Windows Python 3.11 CUDA 12.4 wheel, supports
+partial-download resumption, verifies its published SHA-256, and extracts the
+runtime without C++ headers/static libraries. Existing Python supplies NumPy
+and PyTorch's Python dependencies. The [official PyTorch installation table](https://pytorch.org/get-started/previous-versions/)
+lists CUDA 12.4 wheels for the project's pinned PyTorch 2.5.1; this machine's
+NVIDIA driver 552.44 reports CUDA 12.4 support.
+
+The ordinary neural trainer defaults to `--device auto`, selecting CUDA only
+when its Python environment supports it. The system Python's `+cpu` PyTorch
+build cannot use the GPU; use the launcher for this dedicated GPU runtime.
+`python` on this machine resolves to Inkscape's bundled Python, so use `$py`
+as shown above. Linux continues to use its own `.venv-cuda/bin/python`.
+
+Training runs on the selected device. The CUDA launcher now defaults to FP32
+CUDA checkpoint validation and test scoring, skipping final CPU validation.
+`--no-skip-cpu-validation` and `--test-device cpu` restore CPU reference scoring.
+Arithmetic round trips use the NumPy CPU reference. Low GPU utilization during
+those sampled CPU coding checks is expected. Reports record the training device, GPU name, CUDA version, and peak
+allocated GPU memory. `--device cpu` explicitly selects CPU training.
+
+## Filtered MeshCore corpus
+
+The current `data/messages.jsonl` and `data/messages.csv` exclude all messages
+from `#test`, `#alert`, `#bot`, and `#nrl`. Both now contain **48,552 messages**,
+down from 72,340. Removed counts: `#test` 19,068; `#alert` 2,698; `#bot` 677;
+`#nrl` 1,345 (23,788 total). Other records retain their original values and order.
+The source database was not changed. Original exports are preserved as
+`data/messages.*.before-channel-filter-*.bak`; `data/channel-filter-report.json`
+records the exact paths, counts, and before/after SHA-256 values.
+
+Repeat the same filtering on future existing exports with:
+
+```bash
+python filter_message_corpus.py --report data/channel-filter-report.json
+```
+
+To produce a filtered export directly from the database:
+
+```bash
+python extract_messages.py data/meshcore.db --output data/messages.jsonl --overwrite \
+  --exclude-channel '#test' --exclude-channel '#alert' \
+  --exclude-channel '#bot' --exclude-channel '#nrl'
+```
+
+Use `--output data/messages.csv` for CSV. Exclusions do not remove private or
+unmapped messages. Existing trained models and their saved train/validation/test
+splits still describe the old corpus; train into fresh output directories to
+measure the filtered corpus. Earlier recorded results in this document remain
+historical measurements, not results for this filtered snapshot.
+
+
+On the Windows RTX 3070 machine, the CUDA launcher also works with the default
+`python` command, which points to Inkscape Python 3.10. When the local CUDA runtime
+is present, the launcher automatically relaunches the installed Python 3.11,
+preserving all arguments and the process exit status:
+
+```powershell
+python train_nn_cuda.py data/messages.jsonl --model-kib 64 --context-bytes 3 --epochs 10 --validation-device cuda --output models/nn-mesh-cuda-new
+```
+
+The existing local CUDA 12.4 runtime was checked successfully with GPU training,
+GPU checkpoint validation, CPU reference scoring, and exact arithmetic round trips.
+No CUDA reinstall is needed for that runtime. Use a new output directory per run.
+
+### Refreshed export including wardriving exclusion
+
+The latest database re-export additionally excludes `#wardriving` (1,960
+messages). Current `data/messages.jsonl` and `data/messages.csv` each contain
+**46,592 messages**: 45,168 channel and 1,424 private messages. The five excluded
+channels account for 25,748 of the source database's 72,340 messages.
+`data/remote-term-export-report.json` records exclusion counts, export checksums,
+and backup paths. The previous four-channel-filtered exports are preserved as
+`data/messages.*.before-wardriving-export-*.bak`.
+
+To repeat this export, add `--exclude-channel '#wardriving'` to the database
+extraction command above, retaining all four earlier exclusions. The source
+database remains unchanged; the existing four-channel filter audit is historical.
+
+The Windows sweep launcher now also switches from Inkscape Python to the installed
+Python 3.11 before loading NumPy or plotting libraries. A working example is:
+
+```powershell
+python sweep_nn_cuda.py data/messages.jsonl --sizes-kib 16,64,256 --contexts 1,3,8 --epochs 10 --validation-device cuda --output models/nn-mesh-sweep-new
+```
+
+The NumPy 2.1.3 environment needs compatible plotting binaries. This machine was
+repaired with Matplotlib 3.9.4 and ContourPy 1.3.2. The `sweep` optional dependency
+now requires Matplotlib >=3.9. On Windows the launcher keeps Matplotlib's font
+cache under `.cache/matplotlib` on the project share.
+
+## Compare codecs on enwik8
+
+`benchmark_enwik8.py` downloads the original **100,000,000-byte enwik8** XML
+corpus from [Matt Mahoney's test-data page](https://mattmahoney.net/dc/textdata.html).
+It preserves every input byte and checks the published MD5 and SHA-1 before
+using the dataset. Files stay under the ignored `data/enwik8/` directory.
+
+```powershell
+$py = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
+& $py benchmark_enwik8.py --download-only
+
+# Full-file gzip level 9, bzip2 level 9, and xz preset 9 comparison.
+& $py benchmark_enwik8.py --output data/enwik8/full-comparison-new
+
+# Add one or more project models; entire enwik8 is used unless a limit is given.
+$env:OPENBLAS_NUM_THREADS = '1'
+& $py benchmark_enwik8.py --model models/nn-mesh-cuda-new-64-4/model.mcnn --output data/enwik8/full-neural-comparison
+
+# Faster exploratory comparison, explicitly labelled as a prefix in the report.
+& $py benchmark_enwik8.py --limit-bytes 65536 --model models/nn-mesh-cuda-new-64-4/model.mcnn --output data/enwik8/prefix-comparison-new
+```
+
+On Linux use your project's `python` instead of `& $py` and set
+`OPENBLAS_NUM_THREADS=1` before invoking Python for the neural reference codec.
+The conventional codecs need only the standard library. Model loading uses the
+project's NumPy dependency. `--model` is repeatable and accepts `.mcnn`, `.mcblm`,
+and `.pnn` files (detected by their magic, not their filename). Models must already
+be trained; the benchmark never trains on enwik8. A cleaned-Wikipedia-trained
+model is not necessarily held out from this older XML corpus; record provenance
+when interpreting compression quality.
+
+Each algorithm writes a real compressed artifact and is decompressed again to
+verify its original byte count and SHA-256. `report.json`, `report.csv`, and console
+output show compressed bytes, bits per original byte, percentage of original,
+and encoding/decoding times. Reports distinguish shared-model storage from the
+total including the supplied model file. Decoder/runtime program storage is not
+counted for either model or conventional codecs. Use a fresh output directory
+for each run; nonempty outputs are refused, and partial reports remain available
+if a later algorithm fails.
+
+Conventional codecs use one continuous stream with their normal container.
+Model codecs use independently reset blocks, default 262,144 bytes, to bound
+memory and report progress. `--model-block-bytes` adjusts that boundary. Their
+benchmark container adds an 84-byte header (magic, model SHA-256, original SHA-256,
+original byte count, block size) and 8 bytes per block (original/compressed sizes).
+`arithmetic_payload_bytes` excludes this container overhead. This is a desktop
+benchmark container, not radio framing. Model arithmetic coding and decoding use
+the existing exact CPU reference; GPU training hardware does not accelerate this
+path. Full neural/Pico reference runs can be substantially slower than standard
+compressors. Prefix results are explicitly marked and must not be presented as
+full-enwik8 scores.
+
+## Add a random Reddit comment sample
+
+`sample_reddit_corpus.py` samples **1,000,000 eligible comments** without replacement
+from all Parquet files under `data/REDDIT_comments`, then combines them with
+`data/combined-messages.jsonl` into a new shuffled corpus. It excludes null,
+whitespace-only, `[deleted]`, and `[removed]` raw bodies. Before writing each
+sampled Reddit comment, it removes Markdown/HTML formatting and URLs, retains
+visible link labels, image descriptions and code contents, collapses repeated
+newlines to one, normalizes horizontal whitespace, and trims surrounding
+whitespace. Literal underscores inside words and arithmetic asterisks are kept.
+Comments are sampled uniformly across eligible raw rows without text
+deduplication, so larger subreddits contribute proportionally more comments.
+Source record IDs, subreddit names, and shard filenames remain as metadata.
+The base corpus is copied through without preprocessing. The manifest records
+cleanup counts and byte totals. Selected URL/formatting-only comments may become
+empty strings; these records are retained to preserve the requested sample count.
+The trainer already skips empty message bodies.
+
+```powershell
+$py = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
+& $py -m pip install 'duckdb>=1.4,<3' 'mistune>=3,<4'
+& $py sample_reddit_corpus.py
+```
+
+Default outputs are `data/reddit-comments-1m.jsonl`,
+`data/combined-messages-reddit-1m.jsonl`, and
+`data/combined-messages-reddit-1m.manifest.json`. Existing inputs and outputs are
+never overwritten. The manifest records source shard sizes/row counts, seed,
+selected IDs count, per-subreddit/shard sample counts, corpus counts, and SHA-256
+hashes for the original, sample, and combined JSONL files.
+
+`--count`, `--seed`, `--base`, `--sample`, `--output`, and `--memory-limit` are
+configurable. The default seed is 42, the default memory budget is 4GB, and
+DuckDB uses one thread for repeatable reservoir selection and output shuffling.
+The shuffle distributes the original sources and Reddit across the new corpus;
+original JSON records retain all fields. The complete Parquet body columns must
+be scanned to exclude placeholders before uniform sampling. Temporary query
+spill files stay alongside the output, not on the system drive.
+
+### Run the Reddit export on the share host
+
+Run from the project's **local filesystem directory on the server**, rather
+than through an SMB/network mount. Create a small environment for the one required
+library; CUDA, PyTorch, NumPy, and PyArrow are not required:
+
+```bash
+python3 -m venv .venv-reddit
+.venv-reddit/bin/python -m pip install duckdb==2.0.1 'mistune>=3,<4'
+.venv-reddit/bin/python -u sample_reddit_corpus.py --count 1000000 --seed 42 --memory-limit 4GB
+```
+
+Do not add `--local-stage` when the dataset is already on the host's local disk;
+that option is only for accelerating reads from a remote share. The script takes
+a snapshot of the Parquet filenames available at startup; files downloaded later
+are not part of that run. It scans all eligible comments in that snapshot before
+selecting one million. `--memory-limit` controls DuckDB's working-memory budget,
+not a hard limit on total process RAM; adjust it for the host if needed.
+
+The original corpus remains unchanged. Default new files:
+
+- `data/reddit-comments-1m.jsonl`: the million sampled Reddit records.
+- `data/combined-messages-reddit-1m.jsonl`: original records plus the sample,
+  shuffled together with the fixed seed.
+- `data/combined-messages-reddit-1m.manifest.json`: counts, source snapshot,
+  sampling settings, per-shard/subreddit distribution, and output hashes.
+
+Existing outputs are refused; choose new `--sample` and `--output` paths for a
+second completed run. Ctrl+C interrupts an active query; incomplete corpus files
+are not published. The tests use tiny synthetic Parquet files; no full Reddit
+export is needed to run them.
+
+### Faster Reddit sampling
+
+The original method remains the default (`--method exact`). On a CPU-limited
+host, use random-block preselection to avoid running text filters and a large
+reservoir over every source row:
+
+```bash
+.venv-reddit/bin/python -u sample_reddit_corpus.py --method fast --count 1000000 --seed 42
+```
+
+Fast mode targets a raw candidate pool four times the requested count by default.
+It samples random DuckDB system blocks before checking bodies, then runs the same
+eligibility filter and final reservoir on that smaller pool. If too few eligible
+comments remain, it doubles block coverage and retries; at 100% it falls back to
+the exact full scan. It still returns exactly the requested number without
+replacement when enough eligible rows exist, preserves comment bodies, removes
+empty/deleted/removed placeholders, and shuffles the combined corpus as before.
+
+The statistical compromise is **clustered approximate sampling**: nearby comments
+can enter the candidate pool together. This is not an exact globally uniform
+sample of eligible comments, and individual shard/subreddit representation can
+vary more. The manifest records `sampling_method`, `candidate_factor`, and every
+attempt's block coverage, including any full-scan fallback. A fixed seed and one
+thread keep runs repeatable for an unchanged snapshot and DuckDB version.
+
+Use `--candidate-factor 8` if placeholders dominate and the default causes retries.
+This processes a larger candidate pool. Fast mode mainly reduces CPU/filtering and
+reservoir work; reading Parquet metadata and some source data is still required,
+so storage performance can limit the speedup. Do not add `--local-stage` on the
+share host, where data is already local. Existing outputs remain protected; use
+new `--sample` and `--output` paths when keeping results from an earlier run.
+
+A small synthetic one-million-row test selected 5,000 eligible rows in 0.145 s
+with fast mode versus 1.356 s with exact mode on the development machine. This is
+an implementation smoke benchmark, not a throughput prediction for Reddit.
+
+## Train on one corpus and verify on another
+
+Both trainers and both sweeps accept `--verification-input` (alias
+`--verification-corpus`). The positional input supplies training messages; all
+validation, early stopping/smoothing selection, test scoring, and arithmetic
+round-trip benchmarks use only the separate verification corpus.
+
+For example, run on the host from the project directory:
+
+```bash
+.venv-cuda/bin/python train_nn_cuda.py data/reddit-comments-1m.jsonl \
+  --verification-input data/messages.jsonl \
+  --model-kib 1024 --context-bytes 8 --epochs 20 \
+  --validation-device cuda --output models/nn-reddit-mesh-verification
+
+.venv-cuda/bin/python sweep_nn_cuda.py data/reddit-comments-1m.jsonl \
+  --verification-input data/messages.jsonl \
+  --sizes-kib 64,256,1024 --contexts 3,4,8 \
+  --validation-device cuda --output models/nn-reddit-mesh-verification-sweep
+
+python train_compression_model.py data/reddit-comments-1m.jsonl \
+  --verification-input data/messages.jsonl --model-kib 256 --order 4 \
+  --output models/stat-reddit-mesh-verification
+```
+
+On Windows the corresponding CUDA launchers work through the default `python`
+command. The verification file may be JSONL or CSV and uses the same `--text-field`
+as training. It needs at least two distinct eligible messages. The default equal
+validation/test fractions split **all** verification text groups 50/50; custom
+fractions are normalized relative weights in this mode. `--split chronological`
+uses first occurrence order; `--split random --seed 42` shuffles groups. Identical
+verification texts never cross validation/test sets. `--evaluation-messages` and
+`--benchmark-messages` still limit the scoring samples; use 0 to score all.
+
+For a JSONL/CSV training input, all eligible messages are training candidates;
+there is no additional 80/10/10 training-source split. Exact matches to any
+eligible verification text are removed from training, including repeats. The
+length/empty-message filters still apply. Training messages are streamed, with
+SHA-256 keys used for duplicate suppression by default. For a very large corpus,
+`--keep-duplicates` avoids the growing duplicate-key set and retains repeated
+training rows. This trades lower memory use for frequency weighting. A preflight
+pass counts eligible training messages before training begins.
+
+Prepared Wikipedia input continues to use its original training partition;
+its validation/test partitions are not used when a separate verification input
+is specified. Matching verification texts are excluded there as well. Original
+prepared splitting/grouping constraints still apply.
+
+Reports record both input identities, verification SHA-256, split counts, and
+training overlap/filter counts under `corpus`. Both sweep manifests also hash the
+verification file and refuse resumption if its contents or settings change.
+The option is shared by `sweep_compression_models.py` too. When omitted, the
+existing single-corpus split and evaluation workflow is unchanged. Use fresh
+output directories when switching to independent verification.

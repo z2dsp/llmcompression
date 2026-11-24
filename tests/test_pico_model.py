@@ -26,13 +26,13 @@ def implementation(monkeypatch):
     return runtime, load('nn_codec'), load('prepare_model')
 
 
-@pytest.fixture
-def model(tmp_path, implementation):
+@pytest.fixture(params=[1, 2, 3])
+def model(tmp_path, implementation, request):
     runtime, codec, prepare = implementation
     source, destination = tmp_path / 'model.mcnn', tmp_path / 'model.pnn'
     rng = np.random.default_rng(42)
-    arrays = [rng.normal(0, 0.2, size=shape).astype(np.float32) for shape in shapes(3, 2, 5)]
-    export_model(source, arrays, 3, 2, 5, 'int8')
+    arrays = [rng.normal(0, 0.2, size=shape).astype(np.float32) for shape in shapes(3, 2, 5, request.param)]
+    export_model(source, arrays, 3, 2, 5, 'int8', request.param)
     metadata = prepare.export(source, destination)
     return runtime.Model(destination, backend='python'), codec, metadata, destination
 
@@ -49,6 +49,7 @@ def test_pico_cdf_is_positive_normalized_and_repeatable(model):
         assert list(runtime.cdf(history)) == cdf
     assert metadata['max_scaled_dot1'] < 1 << 30
     assert metadata['max_scaled_dot2'] < 1 << 30
+    assert metadata['hidden_layers'] == runtime.hidden_layers
 
 
 @pytest.mark.parametrize('message', [b'', b'hello mesh', bytes(range(256)), b'\x00' * 80,

@@ -58,7 +58,7 @@ def run(directory='/llm_pico_demo', iterations=30):
         model.hidden_activation()
 
     def dense2():
-        model.dot(model.w2, model.h, model.logits, model.hidden)
+        model.dot(model.w2, model.output_hidden, model.logits, model.hidden)
 
     def frequencies():
         model.logits[:] = logits_raw
@@ -71,6 +71,15 @@ def run(directory='/llm_pico_demo', iterations=30):
     activation_us = timed(activation, iterations)
     model.h[:] = hidden_raw
     model.hidden_activation()
+    def middle():
+        # The third layer reuses h, so restore layer-one activations each time.
+        model.h[:] = hidden_activated
+        model.middle_layer()
+
+    hidden_activated = array('i', model.h)
+    middle_us = timed(middle, iterations) if model.hidden_layers >= 2 else 0
+    model.h[:] = hidden_activated
+    model.middle_layer()
     dense2()
     logits_raw = array('i', model.logits)
     dense2_us = timed(dense2, iterations)
@@ -117,6 +126,7 @@ def run(directory='/llm_pico_demo', iterations=30):
         'firmware': str(sys.implementation), 'uname': list(os.uname()),
         'cpu_hz': freq, 'model_bytes': os.stat(directory + '/model.pnn')[6],
         'context': model.context, 'embedding': model.embedding, 'hidden': model.hidden,
+        'hidden_layers': model.hidden_layers,
         'iterations': iterations,
         'memory': {'free_before_load': before, 'free_after_load': loaded_free,
                    'model_heap_delta': before - loaded_free, 'free_after_benchmark': gc.mem_free(),
@@ -126,6 +136,7 @@ def run(directory='/llm_pico_demo', iterations=30):
                        'estimated_clock_cycles_per_byte': freq * viper_us / 1000000,
                        'stage_us': {'features': feature_us, 'dense1': dense1_us,
                                     'tanh_lut': activation_us, 'dense2': dense2_us,
+                                    'middle_dense_and_tanh': middle_us,
                                     'softmax_and_cdf': frequencies_us}},
         'sample': {'messages': len(rows), 'original_bytes': original_bytes,
                    'payload_bytes': encoded_bytes, 'bits_per_original_byte': 8 * encoded_bytes / original_bytes,

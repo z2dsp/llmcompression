@@ -1,10 +1,12 @@
-"""Install the official Windows Python 3.11 CUDA wheel in project-local storage.
+"""Install the official CUDA wheel into a compressed local Windows Python 3.11 runtime.
 
-Large buffered transfers avoid small network-share writes. Existing system
-PyTorch supplies dependencies and is left untouched. No executable installer runs.
+Large buffered transfers avoid small network-share writes. The wheel cache stays on the share. System
+PyTorch supplies Python dependencies and is left untouched. No executable installer runs.
 """
 import hashlib
 import html
+import os
+import subprocess
 from pathlib import Path
 import re
 import shutil
@@ -62,12 +64,15 @@ def main():
         raise SystemExit('Wheel SHA-256 mismatch; runtime was not installed.')
     if candidate != wheel:
         candidate.replace(wheel)
-    target = (root / '.cache' / 'cuda-runtime').resolve()
+    target = Path(os.environ['LOCALAPPDATA']) / 'llm-compression' / 'cuda-2.5.1-cu124-py311'
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['compact.exe', '/C', '/I', '/Q', str(target)], check=True)
     extract_wheel(wheel, target)
+    (target / '.ready').write_text(expected + '\n', encoding='ascii')
     print(f'CUDA PyTorch installed in {target}. Run train_nn_cuda.py with this Python.', flush=True)
 
 
-def extract_wheel(wheel, target):
+def extract_wheel(wheel, target, start_at=None):
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(wheel) as archive:
         entries = [(info, target / info.filename) for info in archive.infolist()]
@@ -77,13 +82,30 @@ def extract_wheel(wheel, target):
                for info, _ in entries):
             raise SystemExit('Wheel path escapes installation directory.')
         last = time.monotonic()
+        copying = start_at is None
         for info, path in entries:
+            if info.filename.startswith(('torch/include/', 'torch/share/')) or info.filename.endswith(('.lib', '.h', '.hpp')):
+                continue
+            if info.filename == start_at:
+                copying = True
+            if not copying:
+                continue
             if info.is_dir():
                 path.mkdir(parents=True, exist_ok=True)
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as source, path.open('wb', buffering=16 * 1024 * 1024) as output:
-                shutil.copyfileobj(source, output, length=16 * 1024 * 1024)
+            for attempt in range(5):
+                try:
+                    with archive.open(info) as source, path.open('wb', buffering=4 * 1024 * 1024) as output:
+                        shutil.copyfileobj(source, output, length=4 * 1024 * 1024)
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    print(f'Retrying interrupted copy: {info.filename}', flush=True)
+                    time.sleep(2)
+            if path.suffix.lower() in ('.dll', '.pyd') and info.file_size > 16 * 1024 * 1024 and not str(target).startswith('\\\\'):
+                subprocess.run(['compact.exe', '/C', '/EXE:LZX', '/F', '/I', '/Q', str(path)], check=True, stdout=subprocess.DEVNULL)
             if time.monotonic() - last >= 10:
                 print(f'Extracting {info.filename}', flush=True)
                 last = time.monotonic()

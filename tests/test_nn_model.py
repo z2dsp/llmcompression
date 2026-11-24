@@ -11,14 +11,17 @@ from llm_compression.training_corpus import RecordWriter
 
 @pytest.mark.parametrize('storage', ['float32', 'int8'])
 @pytest.mark.parametrize('context', [0, 1, 16])
-def test_model_storage_and_coding(tmp_path, storage, context):
-    hidden, size = layout(8, context, 4, storage)
-    assert size <= 8192 < model_size(context, 4, hidden + 1, storage)
+@pytest.mark.parametrize('hidden_layers', [1, 2, 3])
+def test_model_storage_and_coding(tmp_path, storage, context, hidden_layers):
+    hidden, size = layout(8, context, 4, storage, hidden_layers)
+    assert size <= 8192 < model_size(context, 4, hidden + 1, storage, hidden_layers)
     rng = np.random.default_rng(10)
-    arrays = [rng.normal(0, 0.05, shape).astype('float32') for shape in shapes(context, 4, hidden)]
+    arrays = [rng.normal(0, 0.05, shape).astype('float32') for shape in shapes(context, 4, hidden, hidden_layers)]
     path = tmp_path / 'model.mcnn'
-    export_model(path, arrays, context, 4, hidden, storage)
+    export_model(path, arrays, context, 4, hidden, storage, hidden_layers)
     model = NeuralModel(path)
+    assert model.hidden_layers == hidden_layers
+    assert path.read_bytes()[:8] == ('MCNNLM0' + str(hidden_layers)).encode()
     assert path.stat().st_size == model.size_bytes == size
     cdf = model.cdf([256] * context)
     assert cdf[0] == 0 and cdf[-1] == TOTAL
@@ -80,6 +83,9 @@ def test_training_selects_exported_validation_and_roundtrips(tmp_path, prepared,
         assert report['runtime']['peak_cuda_allocated_bytes'] > 0
     assert report['model']['model_bytes'] <= 4096
     assert report['model']['context_order'] == 2
+    assert report['model']['hidden_layers'] == report['settings']['hidden_layers'] == 3
+    hidden = report['model']['hidden_dim']
+    assert report['model']['parameter_count'] == 257 * 2 + (2 * 2 + 1) * hidden + 2 * (hidden**2 + hidden) + (hidden + 1) * 256
     assert report['validation']['bits_per_utf8_byte'] == min(r['validation']['bits_per_utf8_byte'] for r in report['epochs'])
     assert report['benchmark']['all_round_trips_exact']
     assert report['benchmark']['messages'] == 2

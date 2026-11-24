@@ -1,0 +1,62 @@
+{
+  "target": "PY32F403V1DT6",
+  "cpu_hz": 144000000,
+  "kernel": "DSP",
+  "pnn_sha256": "7c139cab6dba585546bf0a828f6d7b0857a7ef71feb045270b76f9fff7b5f6f7",
+  "model_bytes": 83156,
+  "memory": {
+    "inference_state_bytes": 3068,
+    "static_ram_bytes": 6928,
+    "conservative_stack_high_water_bytes": 608,
+    "ram_capacity_bytes": 65536,
+    "linker_stack_budget_bytes": 8192
+  },
+  "prediction": {
+    "iterations": 200,
+    "cycles_per_byte": 787100.15,
+    "microseconds_per_byte": 5465.973263888889
+  },
+  "sample": {
+    "messages": 30,
+    "original_bytes": 1298,
+    "payload_bytes": 477,
+    "bits_per_original_byte": 2.9399075500770415,
+    "encode_cycles": 994865124,
+    "decode_cycles": 995344665,
+    "encode_bytes_per_second": 187.8767236793799,
+    "decode_bytes_per_second": 187.7862077052475,
+    "cdf_contexts_match_desktop": 32,
+    "extra_correctness_vectors": 4,
+    "all_payloads_match_desktop": true,
+    "all_round_trips_exact": true
+  },
+  "notes": [
+    "DWT hardware cycle-counter timings exclude UART transfer and host bridge latency.",
+    "144 MHz clock uses nominal internal HSI 8 MHz x18 PLL; oscillator accuracy is not independently measured.",
+    "Model and lookup tables stay in internal flash; no heap allocation.",
+    "Sample may overlap training; compression payload excludes external length/checksum/radio framing."
+  ],
+  "source_sha256": {
+    "nn.c": "62b5b7fce96e753e35cf1d99fca2db49ea81599d2d4525c1ff172addd6abf3cb",
+    "codec.c": "10c2d530d1218d5d032ab359b775016febdb9e20670a809c27e1538131694386",
+    "main.c": "f9b372d42b2c849cc74fd55380b4cc078ec48d515500b875a4a18f7797f3a418",
+    "platform.c": "e8d0cf18b911af0fe9fdf2b39bd646a6268f2702a1d71f269e38d415b736b7cb",
+    "startup.c": "44f91849ffd4a6048002c36d5e8be7c868bb9eaaff43e02912cb4d112304477f"
+  },
+  "firmware_sha256": "3fd79aaf4757ded96b9108b0cc64fd8f24dc924b547c267c8f654f6b1681adfc",
+  "build": {
+    "requested_model_kib": 64,
+    "context": 3,
+    "embedding": 8,
+    "hidden": 224,
+    "source_model_bytes": 65336,
+    "firmware_bytes": 90672,
+    "flash_tensor_bytes": 83084,
+    "reserved_ram_bytes": 15120,
+    "sdk_commit": "982757404a416dd1e0fde921750d61167aed09ee"
+  },
+  "programming": {
+    "readback_verified": true,
+    "options_unchanged": true
+  }
+}

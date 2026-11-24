@@ -103,6 +103,16 @@ class ArithmeticEncoder:
         self._emit(0 if self.low < QUARTER else 1)
         return self.writer.finish()
 
+    def finished_size(self) -> int:
+        """Byte length if finalized now, including termination and byte padding.
+
+        Counting the pending bits avoids copying the growing output buffer or
+        modifying the encoder, so prefix sizes can be inspected incrementally.
+        """
+        if self.finished:
+            return len(self.writer.data)
+        return len(self.writer.data) + (self.writer.used + self.pending + 2 + 7) // 8
+
 
 class ArithmeticDecoder:
     def __init__(self, data: bytes) -> None:

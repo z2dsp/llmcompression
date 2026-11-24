@@ -1,0 +1,53 @@
+{
+  "target": "PY32F403V1DT6",
+  "cpu_hz": 144000000,
+  "kernel": "DSP",
+  "pnn_sha256": "4551ecd6f9dc79b3dbbef76538363119504c21c09151ab3987fb4fb6ab0a8efe",
+  "model_bytes": 50212,
+  "memory": {
+    "inference_state_bytes": 2836,
+    "static_ram_bytes": 6696,
+    "conservative_stack_high_water_bytes": 608,
+    "ram_capacity_bytes": 65536,
+    "linker_stack_budget_bytes": 8192
+  },
+  "prediction": {
+    "iterations": 200,
+    "cycles_per_byte": 461066.185,
+    "microseconds_per_byte": 3201.8485069444446
+  },
+  "sample": {
+    "messages": 30,
+    "original_bytes": 1298,
+    "payload_bytes": 524,
+    "bits_per_original_byte": 3.2295839753466873,
+    "encode_cycles": 560076474,
+    "decode_cycles": 561438502,
+    "encode_bytes_per_second": 333.725854730331,
+    "decode_bytes_per_second": 332.9162487684181,
+    "cdf_contexts_match_desktop": 32,
+    "extra_correctness_vectors": 4,
+    "all_payloads_match_desktop": true,
+    "all_round_trips_exact": true
+  },
+  "notes": [
+    "DWT hardware cycle-counter timings exclude UART transfer and host bridge latency.",
+    "144 MHz clock uses nominal internal HSI 8 MHz x18 PLL; oscillator accuracy is not independently measured.",
+    "Model and lookup tables stay in internal flash; no heap allocation.",
+    "Sample may overlap training; compression payload excludes external length/checksum/radio framing."
+  ],
+  "source_sha256": {
+    "nn.c": "62b5b7fce96e753e35cf1d99fca2db49ea81599d2d4525c1ff172addd6abf3cb",
+    "codec.c": "10c2d530d1218d5d032ab359b775016febdb9e20670a809c27e1538131694386",
+    "main.c": "f9b372d42b2c849cc74fd55380b4cc078ec48d515500b875a4a18f7797f3a418",
+    "platform.c": "e8d0cf18b911af0fe9fdf2b39bd646a6268f2702a1d71f269e38d415b736b7cb",
+    "startup.c": "44f91849ffd4a6048002c36d5e8be7c868bb9eaaff43e02912cb4d112304477f"
+  },
+  "firmware_sha256": "ac476b9bc8da8cc56c32be167b5a454ae2dd55a0936ebca3318587d41f8799d5",
+  "build": {
+    "firmware_bytes": 57724,
+    "flash_tensor_bytes": 50140,
+    "reserved_ram_bytes": 14888,
+    "sdk_commit": "982757404a416dd1e0fde921750d61167aed09ee"
+  }
+}

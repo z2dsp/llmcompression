@@ -13,9 +13,11 @@ import numpy as np
 from .bit_training import file_sha256, split_corpus
 from .training_corpus import load_prepared, reservoir, take_bytes
 from .nn_model import NeuralModel, TOTAL, advance, compress_payload, decompress_payload, export_model, layout
+from .nn_cuda import Float32Sum, device_batches
 
 VALIDATION_DEFAULTS = {'validate_every': 1, 'validation_device': 'cpu', 'validation_batch_size': 4096,
                        'skip_cpu_validation': False}
+GPU_PIPELINE_DEFAULTS = {'cuda_chunk_bytes': 1048576, 'test_device': 'auto'}
 LEGACY_EARLY_STOPPING_DEFAULTS = {'early_stopping_patience': 0, 'early_stopping_min_delta': 0.0}
 
 
@@ -135,11 +137,12 @@ def target_frequencies(torch, probabilities, targets):
     return floors.gather(1, target).squeeze(1).to(torch.int64) + 1 + (ranks < remaining).to(torch.int64)
 
 
-def evaluate_cuda(messages, model, batch_size=4096):
-    """Batched exported-weight scoring; float64 GPU rounding can differ from CPU.
+def evaluate_cuda(messages, model, batch_size=4096, *, chunk_bytes=1048576):
+    """Batched FP32 exported-weight scoring; rounding can differ from the CPU codec.
 
-    Used for checkpoint selection. Optional final validation and final test/coding
-    use the CPU reference. No training weights or generation loss are scored.
+    Used for checkpoint selection and test scoring. Optional CPU reference
+    validation and exact coding checks remain separate. Scores include exported
+    weight quantization and the codec's integer frequency allocation.
     """
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     import torch
@@ -153,18 +156,19 @@ def evaluate_cuda(messages, model, batch_size=4096):
             message_count += 1
             yield message
     with torch.inference_mode():
-        embedding, w1, b1, w2, b2 = [torch.from_numpy(array).to('cuda') for array in model.arrays]
-        bits = torch.zeros((), device='cuda', dtype=torch.float64)
-        for x, y in training_batches(counted_messages(), model.context, batch_size):
-            history = torch.from_numpy(x).to('cuda', non_blocking=True)
-            targets = torch.from_numpy(y).to('cuda', non_blocking=True)
-            features = embedding[history].reshape(len(y), model.context * model.embedding)
-            logits = torch.tanh(features @ w1 + b1) @ w2 + b2
-            probabilities = torch.exp(logits - logits.amax(dim=1, keepdim=True))
-            probabilities /= probabilities.sum(dim=1, keepdim=True)
+        # Cast on the host first: no FP64 weights or arithmetic reach the GPU.
+        arrays = [torch.from_numpy(array.astype(np.float32)).to('cuda') for array in model.arrays]
+        bits = Float32Sum(torch, 'cuda')
+        for history, targets in device_batches(torch, counted_messages(), model.context, batch_size,
+                                               chunk_bytes=chunk_bytes):
+            features = arrays[0][history].reshape(len(targets), model.context * model.embedding)
+            for index in range(1, len(arrays) - 2, 2):
+                features = torch.tanh(features @ arrays[index] + arrays[index + 1])
+            logits = features @ arrays[-2] + arrays[-1]
+            probabilities = torch.softmax(logits, dim=1)
             frequencies = target_frequencies(torch, probabilities, targets)
-            bits.sub_(torch.log2(frequencies.to(torch.float64) / TOTAL).sum())
-            byte_count += len(y)
+            bits.add(-torch.log2(frequencies.to(torch.float32) / TOTAL).sum())
+            byte_count += len(targets)
         value = bits.item()
     if not byte_count:
         raise ValueError('Cannot evaluate an empty split')
@@ -174,24 +178,38 @@ def evaluate_cuda(messages, model, batch_size=4096):
             'bits_per_utf8_byte': value / byte_count}
 
 
-def make_network(torch, context, embedding, hidden):
+def make_network(torch, context, embedding, hidden, hidden_layers=3):
+    if hidden_layers not in (1, 2, 3):
+        raise ValueError('Expected one, two, or three hidden layers')
     class Network(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.embedding = torch.nn.Embedding(257, embedding)
             self.hidden = torch.nn.Linear(context * embedding, hidden)
+            self.hidden2 = torch.nn.Linear(hidden, hidden) if hidden_layers >= 2 else None
+            self.hidden3 = torch.nn.Linear(hidden, hidden) if hidden_layers == 3 else None
             self.output = torch.nn.Linear(hidden, 256)
 
         def forward(self, x):
             x = self.embedding(x).reshape(x.shape[0], context * embedding)
-            return self.output(torch.tanh(self.hidden(x)))
+            x = torch.tanh(self.hidden(x))
+            if self.hidden2 is not None:
+                x = torch.tanh(self.hidden2(x))
+            if self.hidden3 is not None:
+                x = torch.tanh(self.hidden3(x))
+            return self.output(x)
 
         def arrays(self):
-            return [self.embedding.weight.detach().cpu().numpy(),
-                    self.hidden.weight.detach().cpu().numpy().T,
-                    self.hidden.bias.detach().cpu().numpy(),
-                    self.output.weight.detach().cpu().numpy().T,
-                    self.output.bias.detach().cpu().numpy()]
+            arrays = [self.embedding.weight.detach().cpu().numpy()]
+            layers = [self.hidden]
+            if self.hidden2 is not None:
+                layers.append(self.hidden2)
+            if self.hidden3 is not None:
+                layers.append(self.hidden3)
+            for layer in layers + [self.output]:
+                arrays.extend([layer.weight.detach().cpu().numpy().T,
+                               layer.bias.detach().cpu().numpy()])
+            return arrays
     return Network()
 
 
@@ -217,13 +235,15 @@ def resolve_device(torch, requested):
 def train(args):
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
     import torch
-    hidden, planned_size = layout(args.model_kib, args.context_bytes, args.embedding_dim, args.storage)
+    hidden, planned_size = layout(args.model_kib, args.context_bytes, args.embedding_dim, args.storage, args.hidden_layers)
     if args.epochs < 1 or args.batch_size < 1 or args.threads < 1 or not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError('Epochs, batch size, threads, and learning rate must be positive')
     if args.evaluation_messages < 0 or args.benchmark_messages < 0 or args.max_message_bytes < 0:
         raise ValueError('Evaluation/benchmark/message limits must be nonnegative')
     if args.validate_every < 1 or args.validation_batch_size < 1:
         raise ValueError('Validation interval and batch size must be positive')
+    if args.cuda_chunk_bytes < 1:
+        raise ValueError('CUDA chunk bytes must be positive')
     if args.skip_cpu_validation and args.validation_device != 'cuda':
         raise ValueError('--skip-cpu-validation requires --validation-device cuda')
     stopping = EarlyStopping(args.early_stopping_patience, args.early_stopping_min_delta)
@@ -232,22 +252,28 @@ def train(args):
     requested_device = args.device
     args.device = resolve_device(torch, requested_device)
     args.validation_device = resolve_device(torch, args.validation_device)
-    uses_cuda = args.device == 'cuda' or args.validation_device == 'cuda'
+    test_device = args.validation_device if args.test_device == 'auto' else resolve_device(torch, args.test_device)
+    uses_cuda = 'cuda' in (args.device, args.validation_device, test_device)
     output = args.output or Path(f'models/nn-{args.model_kib}k-context{args.context_bytes}-{args.storage}')
     if output.exists() and any(output.iterdir()):
         raise ValueError(f'Output is not empty: {output}; choose a new directory')
     prepared = args.input.is_dir() or args.input.name == 'manifest.json'
-    if prepared:
-        if args.limit_messages is not None or args.keep_duplicates:
-            raise ValueError('Prepared splits are fixed; use --train-bytes for a development limit')
-        partitions, corpus = load_prepared(args.input, max_message_bytes=args.max_message_bytes)
-        source = Path(corpus['prepared_manifest'])
+    if getattr(args, 'verification_input', None) is not None:
+        from .external_corpora import load_external
+        partitions, corpus, source = load_external(args)
     else:
-        partitions, corpus = split_corpus(args.input, text_field=args.text_field,
-            validation_fraction=args.validation_fraction, test_fraction=args.test_fraction,
-            split=args.split, seed=args.seed, keep_duplicates=args.keep_duplicates,
-            limit=args.limit_messages, max_message_bytes=args.max_message_bytes)
-        source = args.input
+        prepared = args.input.is_dir() or args.input.name == 'manifest.json'
+        if prepared:
+            if args.limit_messages is not None or args.keep_duplicates:
+                raise ValueError('Prepared splits are fixed; use --train-bytes for a development limit')
+            partitions, corpus = load_prepared(args.input, max_message_bytes=args.max_message_bytes)
+            source = Path(corpus['prepared_manifest'])
+        else:
+            partitions, corpus = split_corpus(args.input, text_field=args.text_field,
+                validation_fraction=args.validation_fraction, test_fraction=args.test_fraction,
+                split=args.split, seed=args.seed, keep_duplicates=args.keep_duplicates,
+                limit=args.limit_messages, max_message_bytes=args.max_message_bytes)
+            source = args.input
     validation = reservoir(partitions['validation'], args.evaluation_messages, args.seed)
     test = reservoir(partitions['test'], args.evaluation_messages, args.seed + 1)
     output.mkdir(parents=True, exist_ok=True)
@@ -260,9 +286,10 @@ def train(args):
         torch.backends.cudnn.allow_tf32 = False
         torch.cuda.reset_peak_memory_stats()
         print(f'CUDA GPU: {torch.cuda.get_device_name(0)}; PyTorch {torch.__version__}; CUDA {torch.version.cuda}', flush=True)
-    network = make_network(torch, args.context_bytes, args.embedding_dim, hidden).to(args.device)
+    network = make_network(torch, args.context_bytes, args.embedding_dim, hidden, args.hidden_layers).to(
+        device=args.device, dtype=torch.float32)
     optimizer = torch.optim.Adam(network.parameters(), lr=args.learning_rate)
-    print(f'Neural model: {planned_size:,} bytes, context {args.context_bytes}, embedding {args.embedding_dim}, hidden {hidden}, {args.storage}; training on {args.device}', flush=True)
+    print(f'Neural model: {planned_size:,} bytes, context {args.context_bytes}, embedding {args.embedding_dim}, {args.hidden_layers} hidden layers of width {hidden}, {args.storage}; training on {args.device}', flush=True)
     started, epochs, best_loss, best_epoch = time.perf_counter(), [], float('inf'), None
     stopped_early = False
     model_path, candidate_path = output / 'model.mcnn', output / 'candidate.mcnn'
@@ -271,19 +298,26 @@ def train(args):
         source_messages = take_bytes(partitions['train'], args.train_bytes) if args.train_bytes else partitions['train']
         # Keep the loss accumulator on device. Reading loss.item() or testing
         # a CUDA boolean every batch forces the CPU to wait for the GPU.
-        loss_total = torch.zeros((), device=args.device, dtype=torch.float64)
+        loss_total = Float32Sum(torch, args.device)
         byte_count = 0
         train_started = time.perf_counter()
         last_progress = time.perf_counter()
-        rng = np.random.default_rng(args.seed + epoch)
-        for x, y in training_batches(source_messages, args.context_bytes, args.batch_size, rng):
+        if args.device == 'cuda':
+            generator = torch.Generator(device='cuda').manual_seed(args.seed + epoch)
+            minibatches = device_batches(torch, source_messages, args.context_bytes, args.batch_size,
+                                        chunk_bytes=args.cuda_chunk_bytes, generator=generator)
+        else:
+            rng = np.random.default_rng(args.seed + epoch)
+            minibatches = ((torch.from_numpy(x), torch.from_numpy(y))
+                           for x, y in training_batches(source_messages, args.context_bytes, args.batch_size, rng))
+        for x, y in minibatches:
             optimizer.zero_grad(set_to_none=True)
-            logits = network(torch.from_numpy(x).to(args.device, non_blocking=True))
-            loss = torch.nn.functional.cross_entropy(logits, torch.from_numpy(y).to(args.device, non_blocking=True))
+            logits = network(x)
+            loss = torch.nn.functional.cross_entropy(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
             optimizer.step()
-            loss_total.add_(loss.detach().to(torch.float64) * len(y))
+            loss_total.add(loss.detach() * len(y))
             byte_count += len(y)
             if time.perf_counter() - last_progress >= 10:
                 if not math.isfinite(loss_total.item()):
@@ -302,14 +336,14 @@ def train(args):
         export_seconds = validation_seconds = 0.0
         if epoch % args.validate_every == 0 or epoch == args.epochs:
             export_started = time.perf_counter()
-            export_model(candidate_path, network.arrays(), args.context_bytes, args.embedding_dim, hidden, args.storage)
+            export_model(candidate_path, network.arrays(), args.context_bytes, args.embedding_dim, hidden, args.storage, args.hidden_layers)
             deployed = NeuralModel(candidate_path)
             if deployed.size_bytes != planned_size or deployed.size_bytes > args.model_kib * 1024:
                 raise ValueError('Exported model exceeds configured storage budget')
             export_seconds = time.perf_counter() - export_started
             print(f'Epoch {epoch}: evaluating exported model on {args.validation_device}', flush=True)
             validation_started = time.perf_counter()
-            val = (evaluate_cuda(validation, deployed, args.validation_batch_size)
+            val = (evaluate_cuda(validation, deployed, args.validation_batch_size, chunk_bytes=args.cuda_chunk_bytes)
                    if args.validation_device == 'cuda' else evaluate(validation, deployed))
             validation_seconds = time.perf_counter() - validation_started
             should_stop = stopping.update(val['bits_per_utf8_byte'])
@@ -344,9 +378,10 @@ def train(args):
         reference_started = time.perf_counter()
         reference_validation = evaluate(validation, deployed)
         reference_validation_seconds = time.perf_counter() - reference_started
-    print(f'Evaluating best epoch {best_epoch} on test data', flush=True)
+    print(f'Evaluating best epoch {best_epoch} on test data ({test_device})', flush=True)
     test_started = time.perf_counter()
-    test_result = evaluate(test, deployed)
+    test_result = (evaluate_cuda(test, deployed, args.validation_batch_size, chunk_bytes=args.cuda_chunk_bytes)
+                   if test_device == 'cuda' else evaluate(test, deployed))
     test_seconds = time.perf_counter() - test_started
     # Reuse precisely the statistical trainer's sampling, framing, and round-trip checks.
     selected = reservoir(test, args.benchmark_messages, args.seed) if not isinstance(test, list) else test
@@ -369,11 +404,12 @@ def train(args):
               'framed_fraction_of_original': framed_size / original, 'all_round_trips_exact': True,
               'reference_python_encode_decode_seconds': time.perf_counter() - bench_start}
     parameter_count = sum(parameter.numel() for parameter in network.parameters())
-    report = {'architecture': 'Fixed preceding-byte embeddings, flattened context, tanh hidden layer, 256-way byte softmax',
+    report = {'architecture': f'Fixed preceding-byte embeddings, flattened context, {args.hidden_layers} tanh hidden layers, 256-way byte softmax',
               'requested_model_kib': args.model_kib,
               'model': {'model_bytes': deployed.size_bytes, 'parameter_count': parameter_count,
                         'context_order': args.context_bytes, 'embedding_dim': args.embedding_dim,
-                        'hidden_dim': hidden, 'storage': args.storage, 'sha256': deployed.sha256},
+                        'hidden_dim': hidden, 'hidden_layers': args.hidden_layers,
+                        'storage': args.storage, 'sha256': deployed.sha256},
               'corpus': {'sha256': file_sha256(source), **corpus}, 'settings': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               'best_epoch': best_epoch, 'validation': reference_validation,
               'selection_validation': selection_validation,
@@ -393,14 +429,19 @@ def train(args):
                                'reference_validation': reference_validation_seconds,
                                'test': test_seconds, 'benchmark': actual['reference_python_encode_decode_seconds']},
               'runtime': {'torch': torch.__version__, 'numpy': np.__version__, 'training_device': args.device, 'requested_device': requested_device,
-                          'validation_device': args.validation_device,
+                          'validation_device': args.validation_device, 'test_device': test_device,
+                          'training_precision': 'float32',
+                          'validation_precision': 'float32' if args.validation_device == 'cuda' else 'float64',
+                          'test_precision': 'float32' if test_device == 'cuda' else 'float64',
+                          'cuda_input_pipeline': 'packed-bytes-v1',
                           'cuda_version': torch.version.cuda,
                           'gpu_name': torch.cuda.get_device_name(0) if uses_cuda else None,
                           'peak_cuda_allocated_bytes': torch.cuda.max_memory_allocated() if uses_cuda else 0},
               'notes': ['File size includes header, weights, biases, and int8 scales; excludes optimizer and training state.',
                         'Training uses float32; validation/test use exported, dequantized weights and integer coding probabilities.',
                         'NumPy float64 CPU inference reference; native MCU port and cross-platform probability agreement are not verified.',
-                        'Optional CUDA float64 validation uses exported weights and codec frequency allocation, but floating-point rounding may differ. Checkpoint selection uses selection_validation. validation is the CPU reference score, or null when skipped; test and coding always use CPU.',
+                        'CUDA validation/test use FP32 exported weights and codec integer frequency allocation; scores may differ slightly from the CPU reference. No FP64 tensors or arithmetic are used on CUDA. selection_validation chooses the checkpoint; validation is CPU reference scoring, or null when skipped. Exact coding checks use the CPU codec.',
+                        'GPU contexts are assembled from bounded packed-byte chunks. Within-batch permutations use a seeded CUDA generator, so CUDA training need not reproduce older model hashes.',
                         'Only scheduled validation epochs and the final epoch compete for checkpoint selection; skipped epochs have validation=null.',
                         'Early stopping monitors validation coding loss, never test loss. Patience counts validation checks, and the lowest measured validation checkpoint is retained independently of min_delta.',
                         'Context resets for each message/prepared record; no history crosses splits or record boundaries.',
@@ -417,7 +458,7 @@ def train(args):
     return report
 
 
-def build_parser(*, sweep=False):
+def build_parser(*, sweep=False, cuda_defaults=False):
     parser = argparse.ArgumentParser(description=__doc__)
     if sweep:
         parser.add_argument('input', type=Path, nargs='?', default=Path('data/messages.jsonl'),
@@ -430,6 +471,8 @@ def build_parser(*, sweep=False):
         parser.add_argument('--context-bytes', '--order', dest='context_bytes', type=int, default=4)
     parser.add_argument('--storage', choices=('float32', 'int8'), default='int8')
     parser.add_argument('--embedding-dim', type=int, default=8)
+    parser.add_argument('--hidden-layers', type=int, choices=(1, 2, 3), default=3,
+                        help='equal-width tanh hidden layers (default: 3); 1 or 2 reproduces an earlier architecture')
     parser.add_argument('--epochs', type=int, default=10,
                         help='maximum training epochs; early stopping may finish sooner (default: 10)')
     parser.add_argument('--early-stopping-patience', '--patience', type=int, default=3,
@@ -442,7 +485,12 @@ def build_parser(*, sweep=False):
         parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto',
                             help='auto selects CUDA when available, otherwise CPU (default: auto)')
     parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--cuda-chunk-bytes', type=int, default=GPU_PIPELINE_DEFAULTS['cuda_chunk_bytes'],
+                        help='packed byte upload chunk; rounded to complete minibatches (default: 1048576)')
+    parser.add_argument('--test-device', choices=('auto', 'cpu', 'cuda'), default='auto',
+                        help='test scoring device; auto follows validation device (default: auto)')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--verification-input', '--verification-corpus', type=Path, help='separate JSONL/CSV used exclusively for validation, test scoring and round trips')
     parser.add_argument('--text-field', choices=('body', 'text'), default='body')
     parser.add_argument('--split', choices=('chronological', 'random'), default='chronological')
     parser.add_argument('--validation-fraction', type=float, default=0.1)
@@ -454,18 +502,18 @@ def build_parser(*, sweep=False):
     parser.add_argument('--evaluation-messages', type=int, default=1000, help='reservoir per held-out split; 0 evaluates all')
     parser.add_argument('--validate-every', type=int, default=VALIDATION_DEFAULTS['validate_every'],
                         help='validate/export every N epochs; the final epoch is always validated (default: 1)')
-    parser.add_argument('--validation-device', choices=('cpu', 'cuda'), default=VALIDATION_DEFAULTS['validation_device'],
-                        help='checkpoint selection scoring: exact CPU reference (default), or batched float64 CUDA')
-    parser.add_argument('--skip-cpu-validation', action='store_true', default=VALIDATION_DEFAULTS['skip_cpu_validation'],
-                        help='skip the final CPU validation pass after CUDA selection; requires --validation-device cuda; test scoring and coding still run')
+    parser.add_argument('--validation-device', choices=('cpu', 'cuda'), default='cuda' if cuda_defaults else VALIDATION_DEFAULTS['validation_device'],
+                        help='checkpoint selection scoring: CPU reference or batched FP32 CUDA (CUDA launcher default: cuda)')
+    parser.add_argument('--skip-cpu-validation', action=argparse.BooleanOptionalAction, default=cuda_defaults or VALIDATION_DEFAULTS['skip_cpu_validation'],
+                        help='skip final CPU validation after CUDA selection; --no-skip-cpu-validation restores it; test scoring and coding still run')
     parser.add_argument('--validation-batch-size', type=int, default=VALIDATION_DEFAULTS['validation_batch_size'],
                         help='byte examples per CUDA validation batch (default: 4096)')
     parser.add_argument('--benchmark-messages', type=int, default=100, help='arithmetic round trips; 0 uses all evaluated test messages')
     return parser
 
 
-def main(argv=None):
-    parser = build_parser()
+def main(argv=None, *, cuda_defaults=False):
+    parser = build_parser(cuda_defaults=cuda_defaults)
     args = parser.parse_args(argv)
     try:
         train(args)

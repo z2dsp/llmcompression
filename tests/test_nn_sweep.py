@@ -109,24 +109,16 @@ def test_cuda_grid_resume_integrity_interruption_and_plots(tmp_path, monkeypatch
     monkeypatch.setattr(nn_sweep.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Should reuse completed runs'))
     assert nn_sweep.main(args + ['--resume']) == 0
     assert model.stat().st_mtime_ns == mtime
-    # Existing default sweeps predate these flags and remain resumable.
-    manifest = json.loads((output / 'sweep.json').read_text())
-    legacy_defaults = {**nn_sweep.VALIDATION_DEFAULTS, **nn_sweep.LEGACY_EARLY_STOPPING_DEFAULTS}
-    for key in legacy_defaults:
-        manifest.pop(key)
-    (output / 'sweep.json').write_text(json.dumps(manifest))
-    for row in summary['results']:
-        path = Path(row['report'])
-        old = json.loads(path.read_text())
-        for key in legacy_defaults:
-            old['settings'].pop(key)
-        old.pop('selection_validation')
-        old.pop('early_stopping')
-        old.pop('cpu_validation_skipped')
-        old['runtime'].pop('validation_device')
-        path.write_text(json.dumps(old))
-    assert nn_sweep.main(args + ['--resume']) == 0
+    # FP64 sweeps must not silently mix scores with the new FP32 backend.
+    manifest_path = output / 'sweep.json'
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    manifest['format'] = 'nn-cuda-sweep-v1'
+    manifest_path.write_text(json.dumps(manifest))
+    with expect_error(capsys, 'Resume configuration/corpus differs'):
+        nn_sweep.main(args + ['--resume'])
     assert model.stat().st_mtime_ns == mtime
+    manifest_path.write_bytes(manifest_bytes)
     with expect_error(capsys, 'Resume configuration/corpus differs'):
         nn_sweep.main(args + ['--resume', '--early-stopping-patience', '3'])
     with expect_error(capsys, 'Output is not empty'):
@@ -166,7 +158,8 @@ def test_cuda_grid_resume_integrity_interruption_and_plots(tmp_path, monkeypatch
     assert model.read_bytes() == original_model
 
 
-def test_cuda_sweep_without_cpu_validation_plots_and_resumes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('hidden_layers', [1, 2, 3])
+def test_cuda_sweep_without_cpu_validation_plots_and_resumes(tmp_path, monkeypatch, hidden_layers):
     pytest.importorskip('matplotlib')
     torch = pytest.importorskip('torch')
     if not torch.cuda.is_available():
@@ -176,6 +169,7 @@ def test_cuda_sweep_without_cpu_validation_plots_and_resumes(tmp_path, monkeypat
     source.write_text(''.join(json.dumps({'body': f'hello mesh {i}'}) + '\n' for i in range(20)))
     output = tmp_path / 'sweep'
     args = [str(source), '--output', str(output), '--sizes-kib', '4', '--contexts', '2',
+            '--hidden-layers', str(hidden_layers),
             '--epochs', '1', '--threads', '1', '--evaluation-messages', '2', '--benchmark-messages', '1',
             '--validation-device', 'cuda', '--skip-cpu-validation']
     assert nn_sweep.main(args) == 0
@@ -186,5 +180,18 @@ def test_cuda_sweep_without_cpu_validation_plots_and_resumes(tmp_path, monkeypat
     assert row['validation_bits_per_utf8_byte'] == report['selection_validation']['bits_per_utf8_byte']
     assert 'CUDA validation estimate' in (output / 'compression.svg').read_text()
     assert report['benchmark']['all_round_trips_exact']
+    assert report['model']['hidden_layers'] == row['hidden_layers'] == hidden_layers
     monkeypatch.setattr(nn_sweep.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Should reuse completed run'))
     assert nn_sweep.main(args + ['--resume']) == 0
+    # Historical sweeps omitted architecture metadata and used one hidden layer.
+    if hidden_layers == 1:
+        manifest = json.loads((output / 'sweep.json').read_text())
+        manifest.pop('hidden_layers')
+        (output / 'sweep.json').write_text(json.dumps(manifest))
+        report['settings'].pop('hidden_layers')
+        report['model'].pop('hidden_layers')
+        Path(row['report']).write_text(json.dumps(report))
+        assert nn_sweep.main(args + ['--resume']) == 0
+    with pytest.raises(SystemExit) as error:
+        nn_sweep.main(args + ['--resume', '--hidden-layers', str(2 if hidden_layers != 2 else 3)])
+    assert error.value.code == 2

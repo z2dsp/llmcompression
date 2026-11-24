@@ -50,7 +50,7 @@ def test_training_stops_after_bad_validation_checks_and_keeps_best_model(tmp_pat
     output = tmp_path / 'trained'
     original_evaluate = nn_training.evaluate
     losses, snapshots = [4.0, 3.0, 3.2, 3.4], []
-    def controlled_validation(messages, model, *args):
+    def controlled_validation(messages, model, *args, **kwargs):
         result = original_evaluate(messages, model)
         if len(snapshots) < len(losses):
             loss = losses[len(snapshots)]

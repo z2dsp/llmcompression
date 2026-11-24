@@ -31,13 +31,14 @@ def export(source, destination):
         raise ValueError('Pico exporter needs int8 weights and a nonzero context')
     data = Path(source).read_bytes()
     offset, arrays, scales = HEADER.size, [], []
-    for shape in shapes(model.context, model.embedding, model.hidden):
+    for shape in shapes(model.context, model.embedding, model.hidden, model.hidden_layers):
         count = math.prod(shape)
         scales.append(struct.unpack_from('<f', data, offset)[0])
         offset += 4
         arrays.append(np.frombuffer(data, dtype='i1', count=count, offset=offset).reshape(shape))
         offset += count
-    embedding, w1, b1, w2, b2 = arrays
+    embedding, w1, b1 = arrays[:3]
+    w2, b2 = arrays[-2:]
     width = model.context * model.embedding
     max1 = width * 128 * 128
     max2 = model.hidden * 4096 * 128
@@ -45,26 +46,38 @@ def export(source, destination):
         raise ValueError('Model too large for signed 32-bit accumulators')
     mul1, shift1 = multiplier(scales[0] * scales[1] * 256, max1)
     pre2 = 8
-    mul2, shift2 = multiplier(scales[3] * 256 / 4096, max2, pre2)
+    mul2, shift2 = multiplier(scales[-2] * 256 / 4096, max2, pre2)
     unsigned = lambda value: (value.astype(np.int16) + 128).astype('u1').tobytes()
-    body = b''.join((
+    blocks = [
         unsigned(embedding), unsigned(w1.T),
         np.rint(b1.astype(np.float64) * scales[2] * 256).astype('<i4').tobytes(),
+    ]
+    middle_scaling = ()
+    for index in range(3, len(arrays) - 2, 2):
+        mul_mid, shift_mid = multiplier(scales[index] * 256 / 4096, max2, pre2)
+        middle_scaling += (mul_mid, shift_mid, pre2)
+        blocks.extend((unsigned(arrays[index].T),
+                       np.rint(arrays[index + 1].astype(np.float64) * scales[index + 1] * 256).astype('<i4').tobytes()))
+    blocks.extend((
         unsigned(w2.T),
-        np.rint(b2.astype(np.float64) * scales[4] * 256).astype('<i4').tobytes(),
+        np.rint(b2.astype(np.float64) * scales[-1] * 256).astype('<i4').tobytes(),
         np.array([round(math.tanh(i / 256) * 4096) for i in range(-2048, 2049)], dtype='<i2').tobytes(),
         np.array([round(math.exp(-i / 256) * 32768) for i in range(4097)], dtype='<u2').tobytes(),
     ))
-    prefix = struct.pack('<8s8I', b'MCPNN001', model.context, model.embedding,
-                         model.hidden, mul1, shift1, mul2, shift2, pre2)
+    body = b''.join(blocks)
+    magic = ('MCPNN00' + str(model.hidden_layers)).encode()
+    prefix = struct.pack('<8s' + str(8 + len(middle_scaling)) + 'I',
+                         magic, model.context, model.embedding,
+                         model.hidden, mul1, shift1, mul2, shift2, pre2, *middle_scaling)
     exported = prefix + hashlib.sha256(prefix + body).digest() + body
     Path(destination).write_bytes(exported)
     return {
-        'format': 'MCPNN001', 'source': str(source), 'source_sha256': model.sha256,
+        'format': magic.decode(), 'source': str(source), 'source_sha256': model.sha256,
         'source_bytes': model.size_bytes, 'export_bytes': len(exported),
         'export_sha256': hashlib.sha256(exported).hexdigest(),
         'context': model.context, 'embedding': model.embedding, 'hidden': model.hidden,
-        'dense_macs_per_byte': model.hidden * (width + 256),
+        'hidden_layers': model.hidden_layers,
+        'dense_macs_per_byte': model.hidden * (width + 256) + (model.hidden_layers - 1) * model.hidden**2,
         'mul1': mul1, 'shift1': shift1, 'mul2': mul2, 'shift2': shift2, 'pre2': pre2,
         'max_abs_dot1': max1, 'max_abs_dot2': max2,
         'max_scaled_dot1': max1 * mul1,

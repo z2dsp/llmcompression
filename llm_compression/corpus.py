@@ -22,7 +22,7 @@ def message_body(text: str, sender: str | None, kind: str) -> str:
 
 
 def extract(database: Path, output: Path, *, file_format="jsonl", kind="all",
-            channel=None, incoming_only=False, overwrite=False) -> dict:
+            channel=None, incoming_only=False, overwrite=False, exclude_channels=()) -> dict:
     database, output = Path(database).resolve(), Path(output).resolve()
     if not database.is_file():
         raise ValueError(f"Database not found: {database}")
@@ -33,7 +33,11 @@ def extract(database: Path, output: Path, *, file_format="jsonl", kind="all",
     if file_format not in {"jsonl", "csv"} or kind not in {"all", "channel", "private"}:
         raise ValueError("Invalid output format or message type")
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    uri = database.as_uri()
+    # SQLite rejects non-local URI authorities; preserve UNC as a path instead.
+    if database.drive.startswith("\\\\"):
+        uri = uri.replace("file://", "file:////", 1)
+    connection = sqlite3.connect(uri + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     temporary = None
     try:
@@ -61,6 +65,12 @@ def extract(database: Path, output: Path, *, file_format="jsonl", kind="all",
                 raise ValueError("Database has no channel-name mapping")
             filters.append("c.name = ?")
             parameters.append(channel)
+        if exclude_channels:
+            if not can_join:
+                raise ValueError("Database has no channel-name mapping")
+            names = tuple(name.strip().casefold() for name in exclude_channels)
+            filters.append("(c.name IS NULL OR lower(c.name) NOT IN (" + ",".join("?" for _ in names) + "))")
+            parameters.extend(names)
         if incoming_only:
             if "outgoing" not in columns:
                 raise ValueError("Database has no outgoing/incoming marker")
@@ -133,12 +143,13 @@ def main(argv=None):
     parser.add_argument("--format", choices=("jsonl", "csv"), help="default: inferred from output suffix")
     parser.add_argument("--type", choices=("all", "channel", "private"), default="all")
     parser.add_argument("--channel", help="optional channel name filter")
+    parser.add_argument("--exclude-channel", action="append", default=[], help="repeatable channel exclusion; preserves private/unmapped messages")
     parser.add_argument("--incoming-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     try:
         report = extract(args.database, args.output, file_format=args.format or ("csv" if args.output.suffix.lower() == ".csv" else "jsonl"),
-                         kind=args.type, channel=args.channel, incoming_only=args.incoming_only, overwrite=args.overwrite)
+                         kind=args.type, channel=args.channel, incoming_only=args.incoming_only, overwrite=args.overwrite, exclude_channels=args.exclude_channel)
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

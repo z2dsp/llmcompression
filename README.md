@@ -137,6 +137,16 @@ For longer Wikipedia contexts, prepare a fresh corpus with larger
 `--sample-bytes`, or `--sample-bytes 0` for whole articles and train with
 `--max-message-bytes 0`. The existing prepared corpus uses 160-byte samples.
 
+To add conversational training data to your combined messages, run
+`python append_dailydialog.py`. It downloads the pinned
+[ConvLab/DailyDialog dataset](https://huggingface.co/datasets/ConvLab/dailydialog)
+and adds all 102,979 utterances to `data/combined-messages.jsonl` using the `body`
+field. Reruns skip already imported source IDs, and an existing corpus is backed
+up before replacement. This importer uses only Python's standard library.
+DailyDialog is licensed CC BY-NC-SA 4.0. See the
+[DailyDialog workflow](MCU_TRAINING.md#add-dailydialog-utterances-to-the-combined-corpus)
+for options and training split guidance.
+
 ## Tests and source
 
 ```bash
@@ -162,8 +172,25 @@ Compare MCU model budgets and context depths with `sweep_compression_models.py`;
 Train bounded-storage neural byte models on the same datasets with `train_nn_compression_model.py`; see [neural comparison training](MCU_TRAINING.md#train-neural-models-for-comparison).
 
 Use `train_nn_cuda.py` for CUDA training and `sweep_nn_cuda.py` for model-size/context
-sweeps, GPU validation, and early stopping; see [MCU_TRAINING.md](MCU_TRAINING.md).
+sweeps. Both now default to FP32 GPU training, validation, and test scoring, with
+no FP64 CUDA arithmetic. See the [FP32 GPU workflow](MCU_TRAINING.md#fp32-gpu-training-and-scoring)
+for commands, CPU reference options, and measured performance.
+
+Generate a text continuation with
+`.venv/bin/python generate_nn.py MODEL.mcnn "Initial context" --bytes 200`.
+Add `--temperature 0.8 --seed 42` for reproducible sampling instead of the default
+greedy choice; see [text generation](MCU_TRAINING.md#generate-a-continuation).
+
+Explore neural model activations with `.venv/bin/python visualize_nn.py` and
+choose a trained `model.mcnn` file. Type a message, step through UTF-8 bytes, or
+press Play to see the embeddings, hidden neurons, and next-byte probabilities
+change. See the [activation viewer](MCU_TRAINING.md#visualize-neural-activations).
 
 For integer inference and lossless compression on a Raspberry Pi Pico W, see the
 [Pico MicroPython demo](pico/README.md), including Viper kernels and measured
 [benchmark results](pico/benchmark-results.json).
+
+The [PY32F403 native firmware](py32f403/README.md) runs the same integer codec
+with flash-resident weights, a 2.8 KiB NN working state, and ST-Link/UART build
+and benchmark tools for a 64 KiB RAM MCU.
+Compare model codecs with gzip, bzip2, and xz using `benchmark_enwik8.py`; see the [enwik8 benchmark workflow](MCU_TRAINING.md#compare-codecs-on-enwik8).

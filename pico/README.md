@@ -6,14 +6,20 @@ MicroPython. The tested model is
 weights/scales/header, context 3, embedding 8, and 108 hidden units. Each byte
 prediction requires 30,240 dense multiply-accumulates.
 
-Both dense layers, the hidden activation, and probability allocation use
+The dense layers, hidden activations, and probability allocation use
 `@micropython.viper` and contiguous integer buffers.
 There is no floating-point inference: hidden activations use an 8 KiB tanh
 lookup table, and softmax uses an 8 KiB exponential lookup table. Integer
 normalization produces 256 positive frequencies summing to 65,536. The exported
 model is 50,212 bytes including these tables and converted biases.
 
-The format is `MCPNN001`. Its probability arithmetic differs from the existing
+The measured one-hidden-layer model uses `MCPNN001`. New training defaults to
+three equal-width hidden layers; the exporter writes these as `MCPNN003`, supported
+by both the Python and Viper paths. Existing two-layer `MCPNN002` files remain
+supported. Two- and three-layer inference reuse two activation buffers. The figures below describe the original one-layer model.
+Use `--hidden-layers 1` during training to reproduce that architecture.
+
+PNN probability arithmetic differs from the existing
 float64 `.mcnn` codec. Both sender and receiver must use the same `.pnn` file and
 integer runtime. The trained weights are retained; this does not retrain the
 network. Model/table bytes are pre-shared, and message length and integrity
