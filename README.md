@@ -194,3 +194,9 @@ The [PY32F403 native firmware](py32f403/README.md) runs the same integer codec
 with flash-resident weights, a 2.8 KiB NN working state, and ST-Link/UART build
 and benchmark tools for a 64 KiB RAM MCU.
 Compare model codecs with gzip, bzip2, and xz using `benchmark_enwik8.py`; see the [enwik8 benchmark workflow](MCU_TRAINING.md#compare-codecs-on-enwik8).
+
+## Train a small T9 keyboard predictor
+
+See [T9 training and prediction](T9_TRAINING.md) for size-bounded neural models trained to recover text from ambiguous phone keys. Train with `python train_t9_model.py corpus.txt --model-kib 1024 --output models/t9-1m` (or `train_t9_cuda.py` for CUDA), convert independent text with `python text_to_t9.py heldout.txt heldout.t9`, then decode and measure best-guess letter/word accuracy with `python predict_t9.py models/t9-1m/model.t9nn heldout.t9 predicted.txt --reference heldout.txt`.
+
+Try the desktop typing simulator with `python visualize_t9.py models/t9-custom/model.t9nn` (or `t9-visualize`). Type using the phone keypad, compare word alternatives, replay keystrokes, and inspect text/key embeddings, hidden activations, and letter probabilities. See the [T9 viewer guide](T9_TRAINING.md#t9-typing-simulator-and-activation-viewer).
